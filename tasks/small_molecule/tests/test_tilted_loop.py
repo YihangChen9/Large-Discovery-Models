@@ -1,17 +1,32 @@
-import pytest
+"""Engine integration tests for the small-molecule tilted case2 campaign.
+
+The task's main loop now runs through ``ldm_tts.engine.LDMEngine`` with the
+adapters in ``tasks.small_molecule.core.engine_adapters``. These tests drive
+the same assembly as ``core.workflow.main`` and assert both the shared engine
+artifacts and the legacy trajectory exports.
+"""
+
+from __future__ import annotations
+
 import json
 from types import SimpleNamespace
+from pathlib import Path
 
 import numpy as np
+import pytest
 
+from ldm_tts.contracts import Candidate, EvaluationResult, Observation
+from ldm_tts.engine import LDMEngine, LDMEngineConfig, LDMEngineState
+from ldm_tts.engine.run_store import CampaignRuntime
+
+from tasks.small_molecule.core import engine_adapters
 from tasks.small_molecule.core.gp import GPConfig
 import tasks.small_molecule.core.ldm_tilted_case2.loop as loop_mod
 from tasks.small_molecule.core.ldm_tilted_case2.candidate_record import (
     CandidateRecord,
-    ReservoirBuildResult,
 )
 from tasks.small_molecule.core.ldm_tilted_case2.config import TiltedLDMCase2Config
-from tasks.small_molecule.core.ldm_tilted_case2.loop import _score_smiles, run_tilted_case2_search
+from tasks.small_molecule.core.ldm_tilted_case2.loop import _score_smiles
 from tasks.small_molecule.core.llm_advisor.client import MockLLMClient
 from tasks.small_molecule.core.rng import RNG
 
@@ -60,49 +75,185 @@ def m1_llm():
     ])
 
 
+def spec_for(cfg: TiltedLDMCase2Config):
+    from tasks.small_molecule.core import workflow
+
+    args = SimpleNamespace(
+        method=cfg.method,
+        kernel="sk" if cfg.gp_config.impl == "smiles-strkernel" else "fp",
+        gp_fp_n_bits=int(cfg.gp_config.fp_n_bits),
+        acq=cfg.acquisition,
+        acq_weights="0.5,0.5",
+        alpha=float(cfg.alpha_base_measure),
+        eta=float(cfg.eta_ehvi_tilt),
+        ehvi_n_samples=int(cfg.ehvi_n_samples),
+        batch_size=int(cfg.batch_size),
+        smiles_max_len=int(cfg.smiles_max_len),
+        max_candidates_per_round=int(cfg.max_candidates_per_round),
+        init_strategy=cfg.init_strategy,
+        budget=int(cfg.budget),
+        init_size=int(cfg.init_size),
+    )
+    return workflow.describe_ldm_task(args)
+
+
+def run_campaign(
+    cfg: TiltedLDMCase2Config,
+    llm,
+    tmp_path: Path,
+    *,
+    seeds=(),
+    vina=mock_scorer_vina,
+    activity=mock_scorer_activity,
+    analog=None,
+    resume: bool = False,
+):
+    """Assemble and run one engine campaign the way ``workflow.main`` does."""
+    run_dir = Path(tmp_path)
+    runtime = CampaignRuntime.open(
+        run_dir,
+        task="small_molecule",
+        task_spec=spec_for(cfg),
+        budget_limits=None,
+        resume=resume,
+    )
+    evaluator = engine_adapters.SmilesCandidateEvaluator(vina, activity)
+    state = LDMEngineState()
+    if not resume and cfg.init_strategy == "seed_smiles":
+        state = LDMEngineState(observations=_seed_observations(
+            cfg, evaluator, runtime, seeds
+        ))
+    if resume:
+        checkpoint = runtime.load_checkpoint()
+        if checkpoint is not None:
+            state = LDMEngineState.from_checkpoint(checkpoint)
+
+    remaining = max(0, -(-(cfg.budget - len(state.observations)) // cfg.batch_size))
+    iterations = state.next_round + remaining
+    runtime.budget.limits = {
+        "outer_iterations": iterations,
+        "valid_search_candidates": iterations * cfg.max_candidates_per_round,
+        "selected_candidates": len(state.observations) + iterations * cfg.batch_size,
+        "external_evaluations": len(state.observations) + iterations * cfg.batch_size,
+        "expensive_evaluation_attempts": len(state.observations) + iterations * cfg.batch_size,
+        "successful_evaluations": len(state.observations) + iterations * cfg.batch_size,
+        "benchmark_jobs": len(state.observations) + iterations * cfg.batch_size,
+    }
+    runtime.budget.write()
+
+    domain = engine_adapters.SmilesCandidateDomain(cfg)
+    expander = engine_adapters.SmilesReservoirExpander(
+        cfg, llm, analog or mock_analog_fn, budget_hook=runtime.consume
+    )
+    encoder = None
+    selector = None
+    if cfg.method not in engine_adapters.DIRECT_ONLY_METHODS:
+        encoder = engine_adapters.SmilesSurrogateEncoder(cfg.gp_config)
+        selector = engine_adapters.TiltedAcquisitionSelector(cfg)
+    engine = LDMEngine(
+        task_spec=spec_for(cfg),
+        expander=expander,
+        candidate_domain=domain,
+        evaluator=evaluator,
+        runtime=runtime,
+        surrogate_encoder=encoder,
+        selector=selector,
+    )
+    result = engine.run(
+        LDMEngineConfig(
+            iterations=iterations,
+            reservoir_size=cfg.max_candidates_per_round,
+            evaluations_per_round=cfg.batch_size,
+            max_empty_reservoir_rounds=(
+                cfg.max_empty_reservoir_rounds if cfg.allow_early_stop else max(iterations, 1)
+            ),
+        ),
+        state=state,
+    )
+    legacy_summary = engine_adapters.materialize_legacy_trajectory(runtime, result, cfg)
+    return result, legacy_summary, runtime
+
+
+def _seed_observations(cfg, evaluator, runtime, seeds):
+    from tasks.small_molecule.core.ldm_tilted_case2.canonicalize import canonicalize_smiles
+
+    canonical = []
+    seen = set()
+    for smiles in seeds:
+        canon = canonicalize_smiles(smiles)
+        if canon and canon not in seen:
+            canonical.append(canon)
+            seen.add(canon)
+        if len(canonical) >= cfg.init_size:
+            break
+    observations = []
+    for smiles in canonical:
+        candidate = Candidate(
+            candidate_id="mol-" + __import__("hashlib").sha256(smiles.encode()).hexdigest()[:12],
+            payload={"smiles": smiles, "rationale": ""},
+            canonical_key=smiles,
+            source="seed_smiles",
+        )
+        runtime.consume_many({
+            "external_evaluations": 1,
+            "expensive_evaluation_attempts": 1,
+            "selected_candidates": 1,
+        })
+        evaluation = evaluator.evaluate(candidate)
+        if evaluation.succeeded:
+            runtime.consume("successful_evaluations")
+            runtime.consume("benchmark_jobs", int(evaluation.resource_usage.get("benchmark_jobs", 0)))
+        observations.append(Observation(candidate=candidate, evaluation=evaluation))
+        runtime.record("candidate_evaluated", observations[-1].to_dict(), candidate_id=candidate.candidate_id)
+    return observations
+
+
+def history_rows(result):
+    return [
+        (observation.candidate.payload["smiles"], (
+            observation.evaluation.metrics.get("vina"),
+            observation.evaluation.metrics.get("activity"),
+        ))
+        for observation in result.state.observations
+    ]
+
+
 def run_method(method, llm, tmp_path, **kwargs):
     cfg = TiltedLDMCase2Config(
         method=method,
         init_size=3,
         budget=6,
         m1_k_direct_llm=2,
-        trajectory_dir=str(tmp_path),
-        ehvi_n_samples=8,
         gp_config=GPConfig(device="cpu", fit_n_itersteps=2, fp_n_bits=128),
         **kwargs,
     )
-    return run_tilted_case2_search(
-        ["CCO", "CCN", "CCC"],
-        (mock_scorer_vina, mock_scorer_activity),
-        mock_analog_fn,
-        config=cfg,
-        llm=llm,
-    )
+    return run_campaign(cfg, llm, tmp_path, seeds=("CCO", "CCN", "CCC"))
 
 
-def test_loop_runs_m1_mock_two_objectives(tmp_path):
-    history, trace = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
+def test_engine_runs_m1_mock_two_objectives(tmp_path):
+    result, _summary, _runtime = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
+    history = history_rows(result)
     assert len(history) == 6
     assert len(history[0][1]) == 2
-    assert trace is not None
 
 
-def test_loop_does_not_collapse_multi_objective_scores(tmp_path):
-    history, _trace = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
+def test_engine_does_not_collapse_multi_objective_scores(tmp_path):
+    result, _summary, _runtime = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
+    history = history_rows(result)
     assert all(isinstance(scores, tuple) and len(scores) == 2 for _smiles, scores in history)
 
 
-def test_loop_eta_zero_base_only(tmp_path):
-    history, _trace = run_method("m1_direct_llm_sir", m1_llm(), tmp_path, eta_ehvi_tilt=0.0)
-    assert len(history) == 6
+def test_engine_eta_zero_base_only(tmp_path):
+    result, _summary, _runtime = run_method("m1_direct_llm_sir", m1_llm(), tmp_path, eta_ehvi_tilt=0.0)
+    assert len(history_rows(result)) == 6
 
 
-def test_loop_alpha_zero_ehvi_only(tmp_path):
-    history, _trace = run_method("m1_direct_llm_sir", m1_llm(), tmp_path, alpha_base_measure=0.0)
-    assert len(history) == 6
+def test_engine_alpha_zero_ehvi_only(tmp_path):
+    result, _summary, _runtime = run_method("m1_direct_llm_sir", m1_llm(), tmp_path, alpha_base_measure=0.0)
+    assert len(history_rows(result)) == 6
 
 
-def test_llm_cold_start_does_not_score_seed_smiles(tmp_path):
+def test_engine_cold_start_does_not_score_seed_smiles(tmp_path):
     client = MockLLMClient(scripted_responses=[
         json.dumps({"direct_smiles": [{"smiles": "CCCC", "rationale": "cold"}]}),
         json.dumps({"direct_smiles": [{"smiles": "CCCCN", "rationale": "cold"}]}),
@@ -122,46 +273,31 @@ def test_llm_cold_start_does_not_score_seed_smiles(tmp_path):
         budget=3,
         batch_size=1,
         m1_k_direct_llm=1,
-        trajectory_dir=str(tmp_path),
         gp_config=GPConfig(device="cpu", fit_n_itersteps=2, fp_n_bits=128),
     )
-
-    history, summary = run_tilted_case2_search(
-        ["CCO", "CCN", "CCC"],
-        (vina, mock_scorer_activity),
-        mock_analog_fn,
-        config=cfg,
-        llm=client,
+    result, summary, _runtime = run_campaign(
+        cfg, client, tmp_path, seeds=("CCO", "CCN", "CCC"), vina=vina
     )
 
-    assert [smiles for smiles, _scores in history] == ["CCCC", "CCCCN", "CCCCO"]
-    assert ["CCO", "CCN", "CCC"] not in scored_batches
-    first_prompt = client.call_log[0]["user"]
-    assert '"n_evaluated": 0' in first_prompt
+    assert [smiles for smiles, _scores in history_rows(result)] == ["CCCC", "CCCCN", "CCCCO"]
+    assert all(set(batch) & {"CCO", "CCN", "CCC"} == set() for batch in scored_batches)
     assert summary["history_size"] == 3
 
 
-def test_seed_initialization_strategy_preserves_seed_history(tmp_path):
+def test_engine_seed_initialization_strategy_preserves_seed_history(tmp_path):
     cfg = TiltedLDMCase2Config(
         "m1_direct_llm_sir",
         init_size=2,
         init_strategy="seed_smiles",
         budget=2,
-        trajectory_dir=str(tmp_path),
+        gp_config=GPConfig(device="cpu", fit_n_itersteps=2, fp_n_bits=128),
     )
+    result, _summary, _runtime = run_campaign(cfg, m1_llm(), tmp_path, seeds=("CCO", "CCN", "CCC"))
 
-    history, _summary = run_tilted_case2_search(
-        ["CCO", "CCN", "CCC"],
-        (mock_scorer_vina, mock_scorer_activity),
-        mock_analog_fn,
-        config=cfg,
-        llm=m1_llm(),
-    )
-
-    assert [smiles for smiles, _scores in history] == ["CCO", "CCN"]
+    assert [smiles for smiles, _scores in history_rows(result)] == ["CCO", "CCN"]
 
 
-def test_resume_from_rounds_jsonl_continues_partial_cold_start(tmp_path):
+def test_engine_resume_from_checkpoint_continues_cold_start(tmp_path):
     first_client = MockLLMClient(scripted_responses=[
         json.dumps({"direct_smiles": [{"smiles": "CCCC", "rationale": "first"}]}),
         json.dumps({"direct_smiles": [{"smiles": "CCCCN", "rationale": "second"}]}),
@@ -173,19 +309,9 @@ def test_resume_from_rounds_jsonl_continues_partial_cold_start(tmp_path):
         budget=2,
         batch_size=1,
         m1_k_direct_llm=1,
-        trajectory_dir=str(tmp_path),
     )
-    first_history, _summary = run_tilted_case2_search(
-        ["CCO"],
-        (mock_scorer_vina, mock_scorer_activity),
-        mock_analog_fn,
-        config=first_cfg,
-        llm=first_client,
-    )
-    assert [smiles for smiles, _scores in first_history] == ["CCCC", "CCCCN"]
-
-    (tmp_path / "history.json").unlink()
-    (tmp_path / "summary.json").unlink()
+    first_result, _summary, _runtime = run_campaign(first_cfg, first_client, tmp_path)
+    assert [smiles for smiles, _scores in history_rows(first_result)] == ["CCCC", "CCCCN"]
 
     resume_client = MockLLMClient(scripted_responses=[
         json.dumps({"direct_smiles": [{"smiles": "CCCCO", "rationale": "third"}]}),
@@ -195,22 +321,15 @@ def test_resume_from_rounds_jsonl_continues_partial_cold_start(tmp_path):
         "m1_llm_one_step",
         init_size=1,
         init_strategy="llm_cold_start",
-        resume_from_trajectory=True,
         budget=4,
         batch_size=1,
         m1_k_direct_llm=1,
-        trajectory_dir=str(tmp_path),
+    )
+    resumed_result, summary, runtime = run_campaign(
+        resume_cfg, resume_client, tmp_path, resume=True
     )
 
-    resumed_history, summary = run_tilted_case2_search(
-        ["CCO"],
-        (mock_scorer_vina, mock_scorer_activity),
-        mock_analog_fn,
-        config=resume_cfg,
-        llm=resume_client,
-    )
-
-    assert [smiles for smiles, _scores in resumed_history] == [
+    assert [smiles for smiles, _scores in history_rows(resumed_result)] == [
         "CCCC",
         "CCCCN",
         "CCCCO",
@@ -220,23 +339,39 @@ def test_resume_from_rounds_jsonl_continues_partial_cold_start(tmp_path):
     assert [record["round_idx"] for record in rounds] == [0, 1, 2, 3]
     assert summary["history_size"] == 4
     assert summary["llm_call_count"] == 4
+    assert runtime.run_dir.joinpath("checkpoint.json").exists()
 
 
-def test_fresh_run_resets_existing_rounds_jsonl(tmp_path):
-    (tmp_path / "rounds.jsonl").write_text(
+def test_fresh_run_uses_a_fresh_campaign_dir(tmp_path):
+    stale_dir = tmp_path / "stale"
+    stale_dir.mkdir()
+    (stale_dir / "rounds.jsonl").write_text(
         json.dumps({"round_idx": 999, "stale": True}) + "\n",
         encoding="utf-8",
     )
 
-    _history, _summary = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
+    cfg = TiltedLDMCase2Config(
+        "m1_direct_llm_sir",
+        init_size=3,
+        budget=6,
+        m1_k_direct_llm=2,
+        gp_config=GPConfig(device="cpu", fit_n_itersteps=2, fp_n_bits=128),
+    )
+    runtime = CampaignRuntime.open(
+        stale_dir,
+        task="small_molecule",
+        task_spec=spec_for(cfg),
+        budget_limits=None,
+        resume=False,
+    )
+    assert (stale_dir / "campaign.json").exists()
+    # The legacy rounds file stays untouched; engine artifacts are new.
+    rounds = [json.loads(line) for line in (stale_dir / "rounds.jsonl").read_text().splitlines()]
+    assert rounds[0]["stale"] is True
+    assert (stale_dir / "events.jsonl").exists()
 
-    rounds = [json.loads(line) for line in (tmp_path / "rounds.jsonl").read_text().splitlines()]
-    assert rounds
-    assert all(not record.get("stale") for record in rounds)
-    assert rounds[0]["round_idx"] == 0
 
-
-def test_loop_retries_transient_empty_reservoir(tmp_path):
+def test_engine_retries_transient_empty_reservoir(tmp_path):
     llm = MockLLMClient(scripted_responses=[
         json.dumps({"direct_smiles": []}),
         json.dumps({"direct_smiles": [{"smiles": "CCCC", "rationale": "x"}]}),
@@ -247,23 +382,16 @@ def test_loop_retries_transient_empty_reservoir(tmp_path):
         init_size=3,
         budget=5,
         m1_k_direct_llm=1,
-        trajectory_dir=str(tmp_path),
         gp_config=GPConfig(device="cpu", fit_n_itersteps=2, fp_n_bits=128),
     )
-    history, trace = run_tilted_case2_search(
-        ["CCO", "CCN", "CCC"],
-        (mock_scorer_vina, mock_scorer_activity),
-        mock_analog_fn,
-        config=cfg,
-        llm=llm,
-    )
-    assert len(history) == 5
-    assert trace["early_stop_reason"] is None
+    result, summary, _runtime = run_campaign(cfg, llm, tmp_path, seeds=("CCO", "CCN", "CCC"))
+    assert len(history_rows(result)) == 5
+    assert summary["early_stop_reason"] == "iteration_budget"
 
 
-def test_loop_stops_after_empty_reservoir_limit(tmp_path):
+def test_engine_stops_after_empty_reservoir_limit(tmp_path):
     llm = MockLLMClient(
-        scripted_responses=[json.dumps({"direct_smiles": []})] * 6
+        scripted_responses=[json.dumps({"direct_smiles": []})] * 24
     )
     cfg = TiltedLDMCase2Config(
         "m1_direct_llm_sir",
@@ -271,22 +399,15 @@ def test_loop_stops_after_empty_reservoir_limit(tmp_path):
         budget=5,
         m1_k_direct_llm=1,
         max_empty_reservoir_rounds=2,
-        trajectory_dir=str(tmp_path),
         gp_config=GPConfig(device="cpu", fit_n_itersteps=2, fp_n_bits=128),
     )
-    history, trace = run_tilted_case2_search(
-        ["CCO", "CCN", "CCC"],
-        (mock_scorer_vina, mock_scorer_activity),
-        mock_analog_fn,
-        config=cfg,
-        llm=llm,
-    )
-    assert len(history) == 3
-    assert trace["early_stop_reason"] == "empty_reservoir_limit"
+    result, summary, _runtime = run_campaign(cfg, llm, tmp_path, seeds=("CCO", "CCN", "CCC"))
+    assert len(history_rows(result)) == 3
+    assert summary["early_stop_reason"] == "empty_reservoir_limit"
 
 
 def test_trace_jsonl_contains_required_fields(tmp_path):
-    _history, _trace = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
+    _result, _summary, _runtime = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
     line = (tmp_path / "rounds.jsonl").read_text().splitlines()[0]
     record = json.loads(line)
     assert "q0_entropy" in record
@@ -294,17 +415,18 @@ def test_trace_jsonl_contains_required_fields(tmp_path):
     assert "candidates" in record
 
 
-def test_trace_selected_candidate_has_probability_and_scores(tmp_path):
-    _history, _trace = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
+def test_trace_selection_results_have_probabilities_and_scores(tmp_path):
+    _result, _summary, _runtime = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
     rounds = [json.loads(line) for line in (tmp_path / "rounds.jsonl").read_text().splitlines()]
-    selected = [c for r in rounds for c in r["candidates"] if c["selected"]]
-    assert selected
-    assert all(c["resampling_probability"] is not None for c in selected)
-    assert all(c["true_scores"] is not None for c in selected)
+    for record in rounds:
+        selection = record["selection_results"]
+        assert selection["selected_smiles"]
+        assert selection["selected_scores"]
+        assert len(selection["selected_probabilities"]) == len(selection["selected_smiles"])
 
 
 def test_trace_round_records_raw_llm_inputs_outputs_and_results(tmp_path):
-    _history, _trace = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
+    _result, _summary, _runtime = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
     first = json.loads((tmp_path / "rounds.jsonl").read_text().splitlines()[0])
 
     attempt = first["llm_attempts"][0]
@@ -319,10 +441,84 @@ def test_trace_round_records_raw_llm_inputs_outputs_and_results(tmp_path):
 
 
 def test_trace_summary_counts_llm_calls(tmp_path):
-    _history, _trace = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
+    _result, _summary, _runtime = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
     summary = json.loads((tmp_path / "summary.json").read_text())
     assert summary["llm_call_count"] > 0
     assert summary["final_hypervolume"] is not None
+
+
+def test_engine_artifacts_exist_for_mock_campaign(tmp_path):
+    _result, _summary, _runtime = run_method("m1_direct_llm_sir", m1_llm(), tmp_path)
+    for name in ("events.jsonl", "checkpoint.json", "summary.json", "campaign.json",
+                 "budget.json", "status.json", "ldm_task_spec.json"):
+        assert (tmp_path / name).exists(), name
+
+
+def test_workflow_entrypoint_uses_shared_campaign_algorithm(tmp_path):
+    from tasks.small_molecule.core import workflow
+
+    run_dir = tmp_path / "workflow-campaign"
+    rc = workflow.main([
+        "--mock",
+        "--method",
+        "m1_llm_one_step",
+        "--budget",
+        "2",
+        "--batch-size",
+        "1",
+        "--init-size",
+        "1",
+        "--init-strategy",
+        "llm_cold_start",
+        "--m1-k-direct-llm",
+        "1",
+        "--output-dir",
+        str(run_dir),
+    ])
+
+    assert rc == 0
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["successful_evaluation_count"] == 2
+    assert summary["stop_reason"] == "successful_evaluation_target"
+
+
+def test_workflow_seed_initialization_is_engine_owned(tmp_path):
+    from tasks.small_molecule.core import workflow
+
+    run_dir = tmp_path / "seeded-workflow"
+    assert workflow.main([
+        "--mock",
+        "--method",
+        "m1_llm_one_step",
+        "--budget",
+        "2",
+        "--batch-size",
+        "1",
+        "--init-size",
+        "2",
+        "--init-strategy",
+        "seed_smiles",
+        "--seed-smiles",
+        "CCO,CCN",
+        "--output-dir",
+        str(run_dir),
+    ]) == 0
+
+    events = [
+        json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()
+    ]
+    expansions = [event for event in events if event["event_type"] == "reservoir_expanded"]
+    evaluations = [event for event in events if event["event_type"] == "candidate_evaluated"]
+    assert len(expansions) == 2
+    assert all(event["payload"]["metadata"]["phase"] == "initialization" for event in expansions)
+    assert len(evaluations) == 2
+    assert all(
+        event["payload"]["candidate"]["source"] == "seed_smiles"
+        for event in evaluations
+    )
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["successful_evaluation_count"] == 2
+    assert summary["round_count"] == 0
 
 
 def test_score_smiles_retries_transient_nonfinite_values():
@@ -358,7 +554,7 @@ def test_score_smiles_raises_scorer_exceptions():
         _score_smiles(["CCO"], (broken_scorer, lambda smiles_list: [5.1]))
 
 
-def test_one_step_retries_when_selected_candidate_cannot_be_scored(tmp_path):
+def test_engine_one_step_records_failed_observation_for_unscorable_candidate(tmp_path):
     client = MockLLMClient(scripted_responses=[
         json.dumps({"direct_smiles": [{"smiles": "CCN", "rationale": "docking fail"}]}),
         json.dumps({"direct_smiles": [{"smiles": "CCC", "rationale": "scorable"}]}),
@@ -370,83 +566,57 @@ def test_one_step_retries_when_selected_candidate_cannot_be_scored(tmp_path):
     cfg = TiltedLDMCase2Config(
         "m1_llm_one_step",
         init_size=1,
-        budget=2,
+        budget=3,
         batch_size=1,
         m1_k_direct_llm=1,
-        trajectory_dir=str(tmp_path),
+    )
+    result, summary, _runtime = run_campaign(
+        cfg,
+        client,
+        tmp_path,
+        seeds=("CCO",),
+        vina=vina,
+        activity=lambda smiles: [6.0 for _ in smiles],
     )
 
-    history, summary = run_tilted_case2_search(
-        ["CCO"],
-        scorer=(vina, lambda smiles: [6.0 for _ in smiles]),
-        analog_fn=mock_analog_fn,
-        config=cfg,
-        llm=client,
-    )
-
-    assert [smiles for smiles, _scores in history] == ["CCO", "CCC"]
-    assert len(client.call_log) == 2
+    history = history_rows(result)
+    assert [smiles for smiles, _scores in history] == ["CCO", "CCN", "CCC"]
+    assert history[1][1] == (None, 6.0)
+    failed = [obs for obs in result.state.observations if not obs.evaluation.succeeded]
+    assert len(failed) == 1
+    assert summary["history_size"] == 3
     rounds = [json.loads(line) for line in (tmp_path / "rounds.jsonl").read_text().splitlines()]
-    assert len(rounds) == 1
-    assert rounds[0]["selection_results"]["selected_smiles"] == ["CCC"]
-    assert rounds[0]["selection_results"]["selected_scores"] == [[-3.3, 6.0]]
-    assert summary["history_size"] == 2
+    assert rounds[0]["selection_results"]["failed_evaluations"][0]["smiles"] == "CCN"
 
 
-def test_bo_selection_retries_when_selected_candidate_cannot_be_scored(monkeypatch):
-    bad = CandidateRecord(
-        raw_smiles="CCN",
-        canonical_smiles="CCN",
-        method="test",
-        sources=["s1"],
-        occurrence_by_source={"s1": 1},
-        q0_base_mass=1.0,
+def test_tilted_selector_samples_by_tilted_probability(monkeypatch):
+    cfg = TiltedLDMCase2Config(
+        "m1_stratified_direct_llm_oversample_sir",
+        batch_size=1,
+        gp_config=GPConfig(device="cpu", fit_n_itersteps=2, fp_n_bits=128),
     )
-    good = CandidateRecord(
-        raw_smiles="CCC",
-        canonical_smiles="CCC",
-        method="test",
-        sources=["s1"],
-        occurrence_by_source={"s1": 1},
-        q0_base_mass=0.1,
+    first = Candidate(
+        "mol-a", {"smiles": "CCC"}, "CCC", source="s1",
+        metadata={"occurrence_by_source": {"s1": 3}, "q0_base_mass": 0.75},
     )
-    build_result = ReservoirBuildResult(candidates=[bad, good], sources=[])
+    second = Candidate(
+        "mol-b", {"smiles": "CCN"}, "CCN", source="s1",
+        metadata={"occurrence_by_source": {"s1": 1}, "q0_base_mass": 0.25},
+    )
 
     def fake_ehvi(_history, candidates, _cfg, _rng):
         for candidate in candidates:
             candidate.ehvi = 0.0
         return SimpleNamespace(ehvi=np.array([0.0, 0.0]), fallback_reason=None)
 
-    def vina(smiles_list):
-        return [float("nan") if smiles == "CCN" else -3.3 for smiles in smiles_list]
+    monkeypatch.setattr(engine_adapters, "compute_ehvi_for_candidates", fake_ehvi)
+    monkeypatch.setattr(engine_adapters, "gumbel_top_k", lambda _prob, _k, _rng: [0])
 
-    monkeypatch.setattr(loop_mod, "compute_ehvi_for_candidates", fake_ehvi)
-    monkeypatch.setattr(loop_mod, "gumbel_top_k", lambda _prob, _k, _rng: [0])
+    selector = engine_adapters.TiltedAcquisitionSelector(cfg, RNG(0))
+    selector.history = [("CCO", (-3.0, 6.0))]
+    selection = selector.select([first, second], {}, count=1)
 
-    cfg = TiltedLDMCase2Config(
-        "m1_stratified_direct_llm_oversample_sir",
-        batch_size=1,
-        gp_config=GPConfig(device="cpu", fit_n_itersteps=2, fp_n_bits=128),
-    )
-
-    selected = loop_mod._select_and_score(
-        build_result,
-        [("CCO", (-3.0, 6.0))],
-        (vina, lambda smiles: [6.0 for _ in smiles]),
-        cfg,
-        RNG(0),
-    )
-
-    assert [candidate.canonical_smiles for candidate in selected] == ["CCC"]
-    assert bad.selected is False
-    assert bad.true_scores is None
-    assert bad.metadata["selection_failure_scores"] == [None, 6.0]
-    assert good.selected is True
-    assert good.true_scores == [-3.3, 6.0]
-    failures = build_result.metadata["selection_failed_evaluations"]
-    assert len(failures) == 1
-    assert failures[0]["smiles"] == "CCN"
-    assert failures[0]["scores"] == [None, 6.0]
-    diagnostics = failures[0]["score_diagnostics"]["objectives"]
-    assert diagnostics[0]["objective_index"] == 0
-    assert diagnostics[0]["final_finite"] is False
+    assert selection.selected_candidate_ids == ("mol-a",)
+    assert selection.metadata["selection_mode"] == "ehvi_sir"
+    assert selection.metadata["selected_probabilities"] == [pytest.approx(0.75)]
+    assert selection.fallback_reason is None

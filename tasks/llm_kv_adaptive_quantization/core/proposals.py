@@ -73,6 +73,62 @@ def proposal_response_format(candidate_count: int) -> dict[str, Any]:
     }
 
 
+# Aliases some LLMs use for the canonical quantizer spec fields.
+_SPEC_ALIASES = {
+    "bits": "bit_cap",
+    "bit_cap": "bit_cap",
+    "group_size": None,  # ambiguous: fills whichever of key/value group size is missing
+    "key_group_size": "key_group_size",
+    "value_group_size": "value_group_size",
+    "residual_length": "residual_length",
+    "residual": "residual_length",
+}
+_SPEC_CHOICES = {
+    "bit_cap": BIT_CAPS,
+    "key_group_size": GROUP_SIZES,
+    "value_group_size": GROUP_SIZES,
+    "residual_length": RESIDUAL_LENGTHS,
+}
+
+
+def _snap_to_choice(name: str, value: Any) -> int:
+    """Snap a numeric value to the nearest allowed enum entry for a spec field."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"candidate has non-integer {name}: {value!r}")
+    choices = _SPEC_CHOICES[name]
+    return min(choices, key=lambda choice: abs(choice - value))
+
+
+def _normalize_quantizer_spec(item: Any, *, index: int) -> dict[str, int]:
+    """Normalize an LLM-produced candidate object into a canonical spec.
+
+    Tolerates the aliases and off-enum values that open-ended chat completions
+    commonly return when the serving endpoint ignores ``response_format``.
+    """
+    if not isinstance(item, dict):
+        raise ValueError(f"candidate {index + 1} is not an object")
+    mapped: dict[str, int] = {}
+    for key, value in item.items():
+        target = _SPEC_ALIASES.get(str(key))
+        if target is None:
+            continue
+        snapped = _snap_to_choice(target, value)
+        if target in ("key_group_size", "value_group_size"):
+            mapped.setdefault(target, snapped)
+        else:
+            mapped[target] = snapped
+    if "group_size" in item:
+        shared = _snap_to_choice("key_group_size", item["group_size"])
+        mapped.setdefault("key_group_size", shared)
+        mapped.setdefault("value_group_size", shared)
+    missing = [name for name in SPEC_KEYS if name not in mapped]
+    if missing:
+        raise ValueError(
+            f"candidate {index + 1} is missing field(s): {', '.join(missing)}"
+        )
+    return {name: mapped[name] for name in SPEC_KEYS}
+
+
 def parse_quantizer_specs(text: str, *, expected_count: int) -> list[dict[str, int]]:
     raw = text.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
@@ -82,27 +138,18 @@ def parse_quantizer_specs(text: str, *, expected_count: int) -> list[dict[str, i
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError("proposal response is not valid JSON") from exc
-    candidates = payload.get("candidates") if isinstance(payload, dict) else None
+    if isinstance(payload, list):
+        candidates = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("candidates"), list):
+        candidates = payload["candidates"]
+    else:
+        candidates = None
     if not isinstance(candidates, list) or len(candidates) != expected_count:
         raise ValueError(f"proposal response must contain exactly {expected_count} candidates")
-    parsed: list[dict[str, int]] = []
-    allowed = {
-        "bit_cap": BIT_CAPS,
-        "key_group_size": GROUP_SIZES,
-        "value_group_size": GROUP_SIZES,
-        "residual_length": RESIDUAL_LENGTHS,
-    }
-    for index, item in enumerate(candidates):
-        if not isinstance(item, dict) or set(item) != set(SPEC_KEYS):
-            raise ValueError(f"candidate {index + 1} has invalid fields")
-        spec: dict[str, int] = {}
-        for name, choices in allowed.items():
-            value = item[name]
-            if isinstance(value, bool) or not isinstance(value, int) or value not in choices:
-                raise ValueError(f"candidate {index + 1} has invalid {name}")
-            spec[name] = value
-        parsed.append(spec)
-    return parsed
+    return [
+        _normalize_quantizer_spec(item, index=index + 1)
+        for index, item in enumerate(candidates)
+    ]
 
 
 def materialize_quantizer_source(seed_source: str, spec: dict[str, int]) -> str:
@@ -217,10 +264,15 @@ class EndpointQuantizerExpander:
         ]
         prompt = (
             f"Propose exactly {request.reservoir_size} distinct adaptive KV quantizer parameter "
-            "sets as JSON. Use only the schema fields and allowed enum values. Balance quality "
-            "against compression, vary bit caps, group sizes, and residual lengths within this "
-            "reservoir, and avoid repeating observed specifications. Do not return Python code, "
-            f"markdown, or prose. Observed history: {history}"
+            "sets as JSON. Each candidate must be an object with exactly these four integer "
+            "fields and only these allowed values: bit_cap in [4, 3, 2], key_group_size in "
+            "[16, 32, 64, 128], value_group_size in [16, 32, 64, 128], residual_length in "
+            "[128, 64, 32, 16]. "
+            'Return a JSON object shaped like {"candidates": [{"bit_cap": 4, '
+            '"key_group_size": 32, "value_group_size": 64, "residual_length": 128}]}. '
+            "Balance quality against compression, vary bit caps, group sizes, and residual "
+            "lengths within this reservoir, and avoid repeating observed specifications. Do "
+            f"not return Python code, markdown, or prose. Observed history: {history}"
         )
         if self.before_request is not None:
             self.before_request()

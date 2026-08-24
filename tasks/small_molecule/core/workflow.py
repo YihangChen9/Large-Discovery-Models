@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Small-molecule task workflow for the shared LDM-TTS config runner.
 
-This module wires ``tasks.small_molecule.core.ldm_tilted_case2.loop.run_tilted_case2_search``
-into the common experiment launcher:
+This module wires the small-molecule scientific components into the shared
+``ldm_tts.engine.LDMEngine`` campaign runtime:
 
     LLM proposal reservoir -> shared acquisition-tilted selection -> environment scoring
+
+The task-owned adapters (candidate domain, reservoir expander, evaluator,
+acquisition selector, and surrogate encoder) live in
+``tasks.small_molecule.core.engine_adapters``. The previous task-local
+``ldm_tilted_case2.loop.run_tilted_case2_search`` loop is retired; its pure
+helpers remain importable and its trajectory files are re-exported from the
+engine events.
 
 Example smoke run without external services:
 
@@ -57,11 +64,23 @@ if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
 from ldm_tts.registration.registry import REPOSITORY_RELATIVE_PREFIXES
+from ldm_tts.campaign import (
+    CampaignBudget,
+    CampaignRecipe,
+    CampaignRequest,
+    InitializationExpander,
+    InitializationOrderSelector,
+    run_campaign,
+)
+from ldm_tts.engine import LDMEngineState
+from ldm_tts.engine.run_store import CampaignRuntime, unique_run_dir
+from ldm_tts.data import DataCollectionSink
 from ldm_tts.contracts import (
     AcquisitionSpec,
     CandidateDomainSpec,
     LDMTaskSpec,
     ObjectiveSpec,
+    RawProposal,
     ReservoirExpansionSpec,
     ReservoirSpec,
     ResponseSpaceSpec,
@@ -132,7 +151,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     configure_logging(args)
     output_dir = resolve_output_dir(args)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    resume_requested = bool(args.resume)
+    if resume_requested and not output_dir.exists():
+        raise SystemExit(f"--resume target does not exist: {output_dir}")
+    run_dir = output_dir if resume_requested else unique_run_dir(output_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     if args.dry_run:
         print(json.dumps({
@@ -148,10 +171,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         cfg = build_config(args, output_dir)
-        from tasks.small_molecule.core.ldm_tilted_case2.loop import run_tilted_case2_search
+        from tasks.small_molecule.core import engine_adapters
 
         llm = build_llm(args)
-        scorer = build_mock_scorers() if args.mock else build_real_scorers(args, output_dir)
+        vina_fn, activity_fn = (
+            build_mock_scorers() if args.mock else build_real_scorers(args, output_dir)
+        )
         analog_fn = build_mock_analog_fn() if args.mock else build_real_analog_fn(args, output_dir)
     except ModuleNotFoundError as exc:
         raise SystemExit(
@@ -160,25 +185,190 @@ def main(argv: list[str] | None = None) -> int:
             f"Original import error: {exc}"
         ) from exc
 
-    history, summary = run_tilted_case2_search(
-        parse_seed_smiles(args.seed_smiles),
-        scorer,
+    legacy_resume = resume_requested and not (output_dir / "campaign.json").exists()
+    spec = describe_ldm_task(args)
+
+    evaluator = engine_adapters.SmilesCandidateEvaluator(vina_fn, activity_fn)
+    sink = DataCollectionSink.from_env(default_root=run_dir / "ldm_data")
+
+    domain = engine_adapters.SmilesCandidateDomain(cfg)
+    expander = engine_adapters.SmilesReservoirExpander(
+        cfg,
+        llm,
         analog_fn,
-        config=cfg,
-        llm=llm,
+        rng=None,
+        budget_hook=None,
     )
+    initialization_target = 0
+    if not resume_requested and cfg.init_strategy == "seed_smiles":
+        initial_proposals = _initial_seed_proposals(args, cfg)
+        initialization_target = len(initial_proposals)
+        expander = InitializationExpander(
+            initial_proposals,
+            expander,
+            successful_target=initialization_target,
+            source="seed_smiles",
+        )
+    encoder = None
+    selector = None
+    if cfg.method not in engine_adapters.DIRECT_ONLY_METHODS:
+        encoder = engine_adapters.SmilesSurrogateEncoder(cfg.gp_config)
+        selector = engine_adapters.TiltedAcquisitionSelector(cfg)
+        if initialization_target:
+            selector = InitializationOrderSelector(
+                selector,
+                successful_target=initialization_target,
+            )
+    recipe = CampaignRecipe(
+        task_spec=spec,
+        expander=expander,
+        candidate_domain=domain,
+        evaluator=evaluator,
+        surrogate_encoder=encoder,
+        selector=selector,
+    )
+    minimum_rounds = -(-int(cfg.budget) // int(cfg.batch_size))
+    max_rounds = minimum_rounds + max(1, int(cfg.max_empty_reservoir_rounds))
+    max_attempts = max(int(cfg.budget), int(cfg.budget) * 8)
+    campaign = run_campaign(
+        CampaignRequest(
+            run_dir=run_dir,
+            config=_jsonable_args(args),
+            resume=resume_requested and not legacy_resume,
+            state_factory=lambda runtime: _resolve_engine_state(
+                runtime,
+                engine_adapters,
+                resume=resume_requested,
+                legacy_resume=legacy_resume,
+            ),
+            budget=CampaignBudget(
+                rounds=max_rounds,
+                reservoir_size=cfg.max_candidates_per_round,
+                batch_size=cfg.batch_size,
+                target_successful_evaluations=cfg.budget,
+                max_evaluation_attempts=max_attempts,
+                max_evaluation_attempts_per_round=min(
+                    cfg.max_candidates_per_round, max(8, cfg.batch_size)
+                ),
+                replace_failed_evaluations=True,
+                max_empty_reservoir_rounds=(
+                    cfg.max_empty_reservoir_rounds
+                    if cfg.allow_early_stop
+                    else max_rounds
+                ),
+                extra_limits={
+                    "llm_requests": max_rounds * max(1, cfg.llm_max_retries + 2),
+                    # The stratified direct-LLM reservoir expander issues up to
+                    # `max_candidates_per_round` proposals per round across a
+                    # reservoir expansion plus refill loops, each chunk being a
+                    # separate LLM call. `(llm_max_retries + 2)` only accounts
+                    # for one expansion's worth of calls, so scale by the
+                    # number of chunks (LLM_DIRECT_CHUNK_SIZE == 8) to avoid
+                    # exhausting `proposal_attempts` before the target
+                    # evaluations complete.
+                    "proposal_attempts": max_rounds
+                    * max(1, cfg.llm_max_retries + 2)
+                    * max(1, int(cfg.max_candidates_per_round) // 8),
+                },
+            ),
+            artifact_projector=lambda runtime, result: engine_adapters.materialize_legacy_trajectory(
+                runtime, result, cfg, sink=sink
+            ),
+        ),
+        recipe,
+    )
+    engine_result = campaign.engine
+
+    history = [
+        (observation.candidate.payload["smiles"], (
+            observation.evaluation.metrics.get("vina"),
+            observation.evaluation.metrics.get("activity"),
+        ))
+        for observation in engine_result.state.observations
+    ]
+    legacy_summary = campaign.projected
 
     result = {
-        "output_dir": str(output_dir.resolve()),
+        "output_dir": str(run_dir.resolve()),
         "history_size": len(history),
         "best": best_observed(history, cfg.minimize),
-        "summary": summary,
-        "history_path": str((output_dir / "history.json").resolve()),
-        "summary_path": str((output_dir / "summary.json").resolve()),
-        "rounds_path": str((output_dir / "rounds.jsonl").resolve()),
+        "summary": legacy_summary,
+        "history_path": str((run_dir / "history.json").resolve()),
+        "summary_path": str((run_dir / "summary.json").resolve()),
+        "rounds_path": str((run_dir / "rounds.jsonl").resolve()),
+        "engine_summary": engine_result.summary,
     }
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+def _jsonable_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+        if key != "api_key"
+    }
+
+
+def _resolve_engine_state(
+    runtime: CampaignRuntime,
+    engine_adapters,
+    *,
+    resume: bool,
+    legacy_resume: bool,
+) -> LDMEngineState:
+    if resume:
+        if not legacy_resume:
+            checkpoint = runtime.load_checkpoint()
+            if checkpoint is not None:
+                return LDMEngineState.from_checkpoint(checkpoint)
+        history_rows = _load_legacy_history(Path(runtime.run_dir))
+        return LDMEngineState(
+            observations=engine_adapters.observations_from_history_rows(history_rows)
+        )
+    return LDMEngineState()
+
+
+def _initial_seed_proposals(args, cfg) -> tuple[RawProposal, ...]:
+    from tasks.small_molecule.core.ldm_tilted_case2.canonicalize import canonicalize_smiles
+
+    canonical: list[str] = []
+    seen: set[str] = set()
+    for smiles in parse_seed_smiles(args.seed_smiles):
+        canon = canonicalize_smiles(smiles)
+        if canon and canon not in seen:
+            canonical.append(canon)
+            seen.add(canon)
+        if len(canonical) >= cfg.init_size:
+            break
+    return tuple(
+        RawProposal(
+            {"smiles": smiles, "rationale": ""},
+            "seed_smiles",
+        )
+        for smiles in canonical
+    )
+
+
+def _load_legacy_history(run_dir: Path) -> list[tuple[str, Sequence[object]]]:
+    history_path = run_dir / "history.json"
+    if history_path.exists():
+        rows = json.loads(history_path.read_text(encoding="utf-8"))
+        return [
+            (str(row["smiles"]), tuple(row["scores"]))
+            for row in rows
+        ]
+    from ldm_tts.engine.run_store import load_jsonl
+
+    history: list[tuple[str, Sequence[object]]] = []
+    for record in load_jsonl(run_dir / "rounds.jsonl"):
+        selection = record.get("selection_results", {})
+        for smiles, scores in zip(
+            selection.get("selected_smiles", []),
+            selection.get("selected_scores", []),
+        ):
+            history.append((str(smiles), tuple(scores)))
+    return history
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -469,7 +659,7 @@ def describe_ldm_task(args: argparse.Namespace) -> LDMTaskSpec:
             kind="kernel",
             representation="SMILES subsequence string kernel",
             dimension_policy="implicit",
-            encoder="tasks.small_molecule.core.gp.SMILESStringKernel",
+            encoder="tasks.small_molecule.core.engine_adapters.SmilesSurrogateEncoder",
             version="smiles_strkernel_v1",
         )
     else:
@@ -478,7 +668,7 @@ def describe_ldm_task(args: argparse.Namespace) -> LDMTaskSpec:
             representation="fixed-length molecular fingerprint",
             dimension_policy="fixed",
             dimension=int(args.gp_fp_n_bits),
-            encoder="tasks.small_molecule.core.gp.fingerprint_features",
+            encoder="tasks.small_molecule.core.engine_adapters.SmilesSurrogateEncoder",
             version=f"molecular_fingerprint_{int(args.gp_fp_n_bits)}_v1",
         )
     return LDMTaskSpec(

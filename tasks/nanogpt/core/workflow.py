@@ -30,6 +30,13 @@ if str(_WORKSPACE_ROOT) not in sys.path:
 
 from ldm_tts.contracts.evaluation import as_float as shared_as_float
 from ldm_tts.contracts.evaluation import is_finite_number
+from ldm_tts.campaign import (
+    CampaignBudget,
+    CampaignRecipe,
+    CampaignRequest,
+    async_run_campaign,
+)
+from ldm_tts.engine import LDMEngineState
 from ldm_tts.optimization.acquisition import make_acquisition
 from ldm_tts.data import DataCollectionSink, make_parameter_edit_ir
 from ldm_tts.optimization.search import (
@@ -1617,77 +1624,132 @@ async def async_main(argv: list[str] | None = None) -> int:
     real_evaluations = previous_real_evaluations
     engine.evaluation_count = previous_real_evaluations
 
-    if resume_info is None and max(0, int(args.warmup)) > 0:
-        remaining_real_evaluations = (
-            None
-            if args.max_real_evaluations <= 0
-            else max(0, args.max_real_evaluations - real_evaluations)
-        )
-        warmup_record = await run_warmup(
-            engine,
-            args,
-            requested=max(0, int(args.warmup)),
-            buffer_entries=buffer_entries,
-            buffer_path=buffer_path,
-            run_buffer_path=buffer_snapshot_path,
-            run_name=run_name,
-            logger=logger,
-            progress=progress,
-            feedback_memory=feedback_memory,
-            remaining_real_evaluations=remaining_real_evaluations,
-        )
-        real_evaluations += int(warmup_record.get("real_evaluations") or 0)
-        warmup_states = warmup_record.get("actual_states")
-        if not isinstance(warmup_states, list):
-            warmup_states = []
-        if args.warmup_updates_seed:
-            for actual_state in warmup_states:
-                if not isinstance(actual_state, SearchState) or actual_state.score is None or not finite_score(actual_state.score):
-                    continue
-                latest_actual = actual_state
-                if best_actual is None or is_better(
-                    actual_state.score,
-                    best_actual.score,
-                    minimize=engine.config.minimize,
-                ):
-                    best_actual = actual_state
+    from tasks.nanogpt.core import engine_adapters
 
-    for iteration in range(starting_iteration, starting_iteration + max(0, int(args.iterations))):
-        if args.max_real_evaluations > 0 and real_evaluations >= args.max_real_evaluations:
-            break
-        if isinstance(engine, OperationSearchEngine):
-            buffer_entries = project_buffer_entries(buffer_entries, engine.operation_schema, args)
-        progress.status(
-            f"iteration {iteration}/{starting_iteration + max(0, int(args.iterations)) - 1} "
-            f"buffer={len(buffer_entries)} best={None if best_actual is None else best_actual.score}"
-        )
-        engine.config.seed_train_path = choose_seed_path(args, train_file, best_actual, latest_actual)
-        remaining_real_evaluations = (
-            None
-            if args.max_real_evaluations <= 0
-            else max(0, args.max_real_evaluations - real_evaluations)
-        )
-        record = await run_iteration(
+    tracker = engine_adapters.NanogptCampaignTracker(
+        best_state=best_actual, latest_state=latest_actual
+    )
+    if best_actual is not None and best_actual.score is not None:
+        tracker.previous_best_score = float(best_actual.score)
+    engine_state = LDMEngineState()
+    if resume_info is not None:
+        checkpoint_path = out_dir / "checkpoint.json"
+        if checkpoint_path.exists():
+            checkpoint_payload = json.loads(
+                checkpoint_path.read_text(encoding="utf-8")
+            )
+            engine_state = LDMEngineState.from_checkpoint(
+                checkpoint_payload.get("state", checkpoint_payload)
+            )
+    warmup_target = (
+        max(0, int(args.warmup))
+        if resume_info is None and not args.skip_eval
+        else 0
+    )
+    engine_iterations = (
+        engine_state.next_round
+        + warmup_target
+        + max(0, int(args.iterations))
+    )
+    evaluation_limit = engine_iterations * 2
+    if args.max_real_evaluations > 0:
+        evaluation_limit = max(0, int(args.max_real_evaluations))
+    search_expander = engine_adapters.NanogptIterationExpander(
+        engine=engine,
+        args=args,
+        logger=logger,
+        progress=progress,
+        buffer_entries=buffer_entries,
+        feedback_memory=feedback_memory,
+        buffer_path=buffer_path,
+        run_buffer_path=buffer_snapshot_path,
+        run_name=run_name,
+        train_file=train_file,
+        tracker=tracker,
+    )
+    warmup_expander = engine_adapters.NanogptWarmupExpander(
+        engine=engine,
+        args=args,
+        logger=logger,
+        progress=progress,
+        requested=warmup_target,
+    )
+    expander = engine_adapters.NanogptCampaignExpander(
+        warmup_expander,
+        search_expander,
+        warmup_target=warmup_target,
+    )
+    evaluator = engine_adapters.NanogptEvaluator(
+        engine=engine,
+        args=args,
+        logger=logger,
+        progress=progress,
+        buffer_entries=buffer_entries,
+        feedback_memory=feedback_memory,
+        buffer_path=buffer_path,
+        run_buffer_path=buffer_snapshot_path,
+        run_name=run_name,
+        tracker=tracker,
+    )
+    selector = engine_adapters.NanogptPrecomputedSelector(
+        search_expander,
+        objective_name=engine.config.score_key,
+    )
+    recipe = CampaignRecipe(
+        task_spec=ldm_task_spec,
+        expander=expander,
+        candidate_domain=engine_adapters.NanogptCandidateDomain(),
+        evaluator=evaluator,
+        selector=selector,
+    )
+    campaign = await async_run_campaign(
+        CampaignRequest(
+            run_dir=out_dir,
+            config=_jsonable_args(args),
+            resume=resume_info is not None and (out_dir / "campaign.json").exists(),
+            state=engine_state,
+            budget=CampaignBudget(
+                rounds=engine_iterations,
+                reservoir_size=max(
+                    2,
+                    int(generated_estimate) + (1 if args.evaluate_root else 0),
+                ),
+                batch_size=2,
+                max_evaluation_attempts=evaluation_limit,
+                max_empty_reservoir_rounds=max(engine_iterations, 1),
+            ),
+        ),
+        recipe,
+    )
+    engine_result = campaign.engine
+    if resume_info is None:
+        warmup_record = _warmup_record_from_engine(
+            engine_result,
             engine,
             args,
-            iteration=iteration,
-            buffer_entries=buffer_entries,
-            buffer_path=buffer_path,
-            run_buffer_path=buffer_snapshot_path,
-            run_name=run_name,
-            logger=logger,
-            progress=progress,
-            feedback_memory=feedback_memory,
-            previous_best_score=None if best_actual is None else best_actual.score,
-            remaining_real_evaluations=remaining_real_evaluations,
+            warmup_expander,
+            buffer_size_before=int(warmup_record["buffer_size_before"]),
         )
-        iteration_records.append(record)
-        real_evaluations += int(record.get("real_evaluations") or 0)
+    best_actual = tracker.best_state or best_actual
+    latest_actual = tracker.latest_state or latest_actual
+    iteration_records = _iteration_records_from_expander(
+        search_expander.records,
+        engine_result,
+        engine,
+        args,
+        buffer_entries,
+        logger,
+    )
+    for record in iteration_records:
         actual_states = record.get("actual_states")
         if not isinstance(actual_states, list):
             actual_states = []
         for actual_state in actual_states:
-            if not isinstance(actual_state, SearchState) or actual_state.score is None or not finite_score(actual_state.score):
+            if (
+                not isinstance(actual_state, SearchState)
+                or actual_state.score is None
+                or not finite_score(actual_state.score)
+            ):
                 continue
             latest_actual = actual_state
             if best_actual is None or is_better(
@@ -1696,7 +1758,13 @@ async def async_main(argv: list[str] | None = None) -> int:
                 minimize=engine.config.minimize,
             ):
                 best_actual = actual_state
+    if resume_info is None:
+        real_evaluations += int(warmup_record.get("real_evaluations") or 0)
+    real_evaluations += sum(
+        int(record.get("real_evaluations") or 0) for record in iteration_records
+    )
     progress.finish("done")
+
 
     all_iteration_records = previous_iteration_records + iteration_records
     summary_args = dict(vars(args))
@@ -1737,6 +1805,9 @@ async def async_main(argv: list[str] | None = None) -> int:
         best_actual,
         ldm_task_spec=ldm_task_spec_dict,
     )
+    from tasks.nanogpt.core import engine_adapters as _nanogpt_adapters
+
+    _nanogpt_adapters.merge_engine_summary(summary_path, engine_result.summary)
     logger.write(
         "finish "
         f"new_iterations={len(iteration_records)} total_iterations={len(all_iteration_records)} "
@@ -1765,483 +1836,176 @@ async def async_main(argv: list[str] | None = None) -> int:
     return 0
 
 
-async def run_iteration(
+def _jsonable_args(args: argparse.Namespace) -> dict[str, Any]:
+    return json.loads(
+        json.dumps(
+            {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in vars(args).items()
+                if key not in {"api_key", "operation_schema_object"}
+            },
+            default=str,
+        )
+    )
+
+
+def _warmup_record_from_engine(
+    engine_result,
     engine: SearchEngine,
     args: argparse.Namespace,
+    expander,
     *,
-    iteration: int,
-    buffer_entries: list[BufferEntry],
-    buffer_path: Path,
-    run_buffer_path: Path,
-    run_name: str,
-    logger: RunLogger,
-    progress: ModelBasedProgress,
-    feedback_memory: "FeedbackMemory",
-    previous_best_score: float | None,
-    remaining_real_evaluations: int | None,
+    buffer_size_before: int,
 ) -> dict[str, Any]:
-    if isinstance(engine, OperationSearchEngine):
-        engine.current_iteration = iteration
-        refresh_projected_buffer_entries(buffer_entries, engine.operation_schema, args)
-    buffer_size_before = len(buffer_entries)
-    surrogate = GPSurrogate(
-        buffer_entries,
-        lengthscale=args.gp_lengthscale,
-        noise=args.gp_noise,
-        prior_score=args.prior_score,
-        prior_std=args.prior_std,
-        minimize=engine.config.minimize,
-    )
-    gp_summary_before = surrogate.summary()
-    gp_status = format_gp_progress(gp_summary_before)
-    progress.status(f"iteration {iteration} GP {gp_status}")
-    logger.write(f"iteration={iteration} gp_before {gp_status}")
-    root = engine.create_seed_state()
-    logger.write(
-        f"iteration={iteration} root={root.state_id} method={args.effective_method} "
-        f"buffer_size_before={buffer_size_before}"
-    )
-    actual_states: list[SearchState] = []
-    real_evaluations = 0
-    remaining = remaining_real_evaluations
-    if iteration == 1 and args.evaluate_root:
-        if args.skip_eval:
-            root.error = "Root evaluation skipped by --skip-eval."
-            write_state_update(engine, root)
-        elif remaining == 0:
-            root.error = "Root evaluation deferred because --max-real-evaluations was reached."
-            write_state_update(engine, root)
-        else:
-            engine.evaluate_state(root)
-            progress.evaluated(root)
-            real_evaluations += 1
-            if remaining is not None:
-                remaining = max(0, remaining - 1)
-            actual_states.append(root)
-            feedback_memory.record(
-                kind="root",
-                iteration=iteration,
-                state=root,
-                root=root,
-                selected_surrogate_metrics={},
-                previous_best_score=previous_best_score,
-                best_score_after=None,
-            )
-            engine.config.feedback_context = feedback_memory.prompt_context()
-            entry = make_buffer_entry(
-                root,
-                args,
-                iteration=iteration,
-                run_name=run_name,
-                score_key=engine.config.score_key,
-            )
-            if entry is not None:
-                append_buffer_entry(buffer_path, entry, mirror_path=run_buffer_path)
-                buffer_entries.append(entry)
-                progress.status(
-                    f"iteration {iteration} root {engine.config.score_key}={entry.score:.6g} "
-                    f"delta={format_score_delta(entry.score, previous_best_score, engine.config.minimize)}"
-                )
-                logger.write(
-                    f"iteration={iteration} evaluated_root={root.state_id} "
-                    f"{engine.config.score_key}={entry.score} buffer_size={len(buffer_entries)}"
-                )
-                surrogate = GPSurrogate(
-                    buffer_entries,
-                    lengthscale=args.gp_lengthscale,
-                    noise=args.gp_noise,
-                    prior_score=args.prior_score,
-                    prior_std=args.prior_std,
-                    minimize=engine.config.minimize,
-                )
+    """Project engine-owned warm-up observations into the legacy summary shape."""
 
-    scored_states, leaves = await run_inner_surrogate_search(
-        engine,
-        args,
-        root,
-        surrogate,
-        iteration=iteration,
-        progress=progress,
-    )
-    if isinstance(engine, OperationSearchEngine):
-        refresh_projected_buffer_entries(buffer_entries, engine.operation_schema, args)
-    logger.write(
-        f"iteration={iteration} generated={len(scored_states)} leaves={len(leaves)} "
-        f"select_from={args.select_from}"
-    )
-
-    pool = leaves if args.select_from == "leaves" and leaves else scored_states
-    selectable = [
-        state
-        for state in pool
-        if state.metrics.get("surrogate_score") is not None and not state.metrics.get("feature_only_action")
+    observations = [
+        observation
+        for observation in engine_result.state.observations
+        if str(observation.candidate.payload.get("kind", "")).startswith("warmup")
     ]
-    if not selectable and pool is not scored_states:
-        selectable = [
-            state
-            for state in scored_states
-            if state.metrics.get("surrogate_score") is not None and not state.metrics.get("feature_only_action")
-        ]
-    selected = min(selectable, key=surrogate_sort_key) if selectable else None
-    selected_surrogate_metrics = dict(selected.metrics) if selected is not None else {}
-    if selected is not None:
-        logger.write(
-            f"iteration={iteration} selected={selected.state_id} "
-            f"surrogate_score={selected_surrogate_metrics.get('surrogate_score')} "
-            f"pred={selected_surrogate_metrics.get('surrogate_pred')} "
-            f"std={selected_surrogate_metrics.get('surrogate_std')} "
-            f"ei={selected_surrogate_metrics.get('surrogate_ei')}"
-        )
-        selected.metrics["model_based_selected_iteration"] = iteration
-        write_state_update(engine, selected)
-        if args.skip_eval:
-            engine.defer_evaluation(selected, reason="Real evaluation skipped by --skip-eval.")
-        elif remaining == 0:
-            engine.defer_evaluation(selected, reason="Real evaluation deferred because --max-real-evaluations was reached.")
-        elif selected.status == "generation_error":
-            write_state_update(engine, selected)
-        else:
-            engine.evaluate_state(selected)
-            progress.evaluated(selected)
-            real_evaluations += 1
-            if remaining is not None:
-                remaining = max(0, remaining - 1)
-            selected.metrics.update(
-                {
-                    key: value
-                    for key, value in selected_surrogate_metrics.items()
-                    if key.startswith("surrogate_")
-                    or key in {
-                        "model_based_iteration",
-                        "feature_version",
-                        "feature_source_hash",
-                        "extracted_params",
-                        "operation_schema_version",
-                        "operation_schema_feature_names",
-                        "operation_schema_feature_count",
-                        "operation_feature_expansions",
-                        "operations",
-                    }
-                }
-            )
-            selected.metrics["model_based_selected_iteration"] = iteration
-            write_state_update(engine, selected)
-            actual_states.append(selected)
-            entry = make_buffer_entry(
-                selected,
-                args,
-                iteration=iteration,
-                run_name=run_name,
-                score_key=engine.config.score_key,
-            )
-            if entry is not None:
-                append_buffer_entry(buffer_path, entry, mirror_path=run_buffer_path)
-                buffer_entries.append(entry)
-                progress.status(
-                    f"iteration {iteration} {engine.config.score_key}={entry.score:.6g} "
-                    f"delta={format_score_delta(entry.score, previous_best_score, engine.config.minimize)} "
-                    f"buffer={len(buffer_entries)}"
-                )
-                logger.write(
-                    f"iteration={iteration} evaluated_selected={selected.state_id} "
-                    f"{engine.config.score_key}={entry.score} "
-                    f"delta_vs_prev_best={format_score_delta(entry.score, previous_best_score, engine.config.minimize)} "
-                    f"buffer_size={len(buffer_entries)}"
-                )
-            provisional_best_after = updated_best_score(
-                previous_best_score,
-                selected.score if selected is not None else None,
-                minimize=engine.config.minimize,
-            )
-            feedback_memory.record(
-                kind="selected",
-                iteration=iteration,
-                state=selected,
-                root=root,
-                selected_surrogate_metrics=selected_surrogate_metrics,
-                previous_best_score=previous_best_score,
-                best_score_after=provisional_best_after,
-            )
-            engine.config.feedback_context = feedback_memory.prompt_context()
-    elif not scored_states:
-        logger.write(f"iteration={iteration} selected=none reason=no_scored_states")
-    else:
-        logger.write(f"iteration={iteration} selected=none reason=no_selectable_states")
-
-    selected_real_score = None if selected is None else selected.score
-    iteration_best_score = best_score_from_states(actual_states, minimize=engine.config.minimize)
-    best_after_iteration = updated_best_score(previous_best_score, iteration_best_score, minimize=engine.config.minimize)
-    score_delta = None
-    if selected_real_score is not None and finite_score(selected_real_score) and previous_best_score is not None:
-        score_delta = float(selected_real_score) - float(previous_best_score)
-    gp_summary_after = GPSurrogate(
-        buffer_entries,
-        lengthscale=args.gp_lengthscale,
-        noise=args.gp_noise,
-        prior_score=args.prior_score,
-        prior_std=args.prior_std,
-        minimize=engine.config.minimize,
-    ).summary()
-    logger.write(
-        f"iteration={iteration} result selected={None if selected is None else selected.state_id} "
-        f"{engine.config.score_key}={selected_real_score} "
-        f"iteration_best={iteration_best_score} best_after={best_after_iteration} "
-        f"gp_after {format_gp_progress(gp_summary_after)}"
-    )
-    progress.status(
-        f"iteration {iteration} result {engine.config.score_key}={format_optional_float(selected_real_score)} "
-        f"best={format_optional_float(best_after_iteration)} GP {format_gp_progress(gp_summary_after)}"
-    )
-    if isinstance(engine, OperationSearchEngine):
-        engine.current_iteration = None
-
-    return {
-        "iteration": iteration,
-        "method": args.effective_method,
-        "root_state_id": root.state_id,
-        "selected_state_id": None if selected is None else selected.state_id,
-        "selected_surrogate_score": selected_surrogate_metrics.get("surrogate_score"),
-        "selected_pred": selected_surrogate_metrics.get("surrogate_pred"),
-        "selected_std": selected_surrogate_metrics.get("surrogate_std"),
-        "selected_ei": selected_surrogate_metrics.get("surrogate_ei"),
-        "selected_real_score": selected_real_score,
-        "score_key": engine.config.score_key,
-        "previous_best_score": previous_best_score,
-        "iteration_best_score": iteration_best_score,
-        "best_score_after_iteration": best_after_iteration,
-        "selected_score_delta_vs_previous_best": score_delta,
-        "selected_improved_previous_best": (
-            None
-            if selected_real_score is None or previous_best_score is None
-            else is_better(selected_real_score, previous_best_score, minimize=engine.config.minimize)
-        ),
-        "gp_before": gp_summary_before,
-        "gp_after": gp_summary_after,
-        "generated_count": len(scored_states),
-        "buffer_size_before_iteration": buffer_size_before,
-        "buffer_size_after_iteration": len(buffer_entries),
-        "real_evaluations": real_evaluations,
-        "actual_state_ids": [state.state_id for state in actual_states],
-        "actual_states": actual_states,
-        "selected_state": selected,
-}
-
-
-async def run_warmup(
-    engine: SearchEngine,
-    args: argparse.Namespace,
-    *,
-    requested: int,
-    buffer_entries: list[BufferEntry],
-    buffer_path: Path,
-    run_buffer_path: Path,
-    run_name: str,
-    logger: RunLogger,
-    progress: ModelBasedProgress,
-    feedback_memory: "FeedbackMemory",
-    remaining_real_evaluations: int | None,
-) -> dict[str, Any]:
-    requested = max(0, int(requested))
-    buffer_size_before = len(buffer_entries)
     actual_states: list[SearchState] = []
-    generated_states: list[SearchState] = []
-    scores: list[float | None] = []
-    real_evaluations = 0
-    remaining = remaining_real_evaluations
-    strategy = resolve_warmup_strategy(args, engine)
-    rng_seed = int(args.warmup_seed) if int(args.warmup_seed) != 0 else int(time.time_ns() % (2**32))
-    rng = random.Random(rng_seed)
-    logger.write(
-        f"warmup start requested={requested} strategy={strategy} "
-        f"include_root={args.warmup_include_root} rng_seed={rng_seed} "
-        f"buffer_size_before={buffer_size_before}"
-    )
-    progress.status(f"warmup start n={requested} strategy={strategy}")
-
-    root = engine.create_seed_state()
-    root.metrics["warmup_root"] = True
-    write_state_update(engine, root)
-
-    def can_evaluate_more() -> bool:
-        return remaining is None or remaining > 0
-
-    if args.warmup_include_root and requested > 0:
-        if args.skip_eval:
-            engine.defer_evaluation(root, reason="Warm-up root evaluation skipped by --skip-eval.")
-        elif can_evaluate_more():
-            root.metrics["warmup_index"] = 1
-            root.metrics["warmup_strategy"] = "root"
-            write_state_update(engine, root)
-            engine.evaluate_state(root)
-            progress.evaluated(root)
-            real_evaluations += 1
-            if remaining is not None:
-                remaining = max(0, remaining - 1)
-            actual_states.append(root)
-            scores.append(root.score)
-            feedback_memory.record(
-                kind="warmup_root",
-                iteration=0,
-                state=root,
-                root=root,
-                selected_surrogate_metrics={},
-                previous_best_score=None,
-                best_score_after=root.score,
-            )
-            engine.config.feedback_context = feedback_memory.prompt_context()
-            append_state_to_buffer(
-                root,
-                args,
-                iteration=0,
-                run_name=run_name,
-                score_key=engine.config.score_key,
-                buffer_path=buffer_path,
-                run_buffer_path=run_buffer_path,
-                buffer_entries=buffer_entries,
-                logger=logger,
-                label="warmup_root",
-            )
-        else:
-            engine.defer_evaluation(root, reason="Warm-up root evaluation deferred because --max-real-evaluations was reached.")
-
-    target_total = requested
-    while len(actual_states) < target_total:
-        if args.skip_eval:
-            logger.write("warmup stop reason=skip_eval")
-            break
-        if not can_evaluate_more():
-            logger.write("warmup stop reason=max_real_evaluations")
-            break
-        warmup_index = len(actual_states) + 1
-        progress.status(f"warmup generating {warmup_index}/{target_total}")
-        if strategy == "random_operation":
-            if not isinstance(engine, OperationSearchEngine):
-                raise RuntimeError("random_operation warm-up requires OperationSearchEngine.")
-            child = create_random_operation_warmup_state(
-                engine,
-                root,
-                rng,
-                warmup_index=warmup_index,
-                total=target_total,
-            )
-        else:
-            children = await engine.expand_state(
-                root,
-                1,
-                search_note=(
-                    f"warm-up candidate {warmup_index}/{target_total}: propose a diverse candidate "
-                    "to collect a real score for GP training before model-based search."
-                ),
-            )
-            if not children:
-                logger.write(f"warmup index={warmup_index} generation_failed=no_child")
-                break
-            child = children[0]
-            child.metrics["warmup_index"] = warmup_index
-            child.metrics["warmup_strategy"] = strategy
-            write_state_update(engine, child)
-
-        generated_states.append(child)
-        if child.status == "generation_error":
-            logger.write(f"warmup index={warmup_index} state={child.state_id} generation_error={child.error}")
-            progress.generated(child)
+    for observation in observations:
+        if not observation.evaluation.succeeded:
             continue
-        engine.evaluate_state(child)
-        progress.evaluated(child)
-        real_evaluations += 1
-        if remaining is not None:
-            remaining = max(0, remaining - 1)
-        actual_states.append(child)
-        scores.append(child.score)
-        feedback_memory.record(
-            kind="warmup",
-            iteration=0,
-            state=child,
-            root=root,
-            selected_surrogate_metrics={},
-            previous_best_score=None,
-            best_score_after=best_score_from_states(actual_states, minimize=engine.config.minimize),
-        )
-        engine.config.feedback_context = feedback_memory.prompt_context()
-        append_state_to_buffer(
-            child,
-            args,
-            iteration=0,
-            run_name=run_name,
-            score_key=engine.config.score_key,
-            buffer_path=buffer_path,
-            run_buffer_path=run_buffer_path,
-            buffer_entries=buffer_entries,
-            logger=logger,
-            label="warmup",
-        )
-
-    gp_after = GPSurrogate(
-        buffer_entries,
-        lengthscale=args.gp_lengthscale,
-        noise=args.gp_noise,
-        prior_score=args.prior_score,
-        prior_std=args.prior_std,
-        minimize=engine.config.minimize,
-    ).summary()
-    logger.write(
-        f"warmup finish actual={len(actual_states)} generated={len(generated_states)} "
-        f"real_evaluations={real_evaluations} buffer_size_after={len(buffer_entries)} "
-        f"gp_after {format_gp_progress(gp_after)}"
-    )
-    progress.status(f"warmup done n={len(actual_states)} GP {format_gp_progress(gp_after)}")
+        state = state_from_id(engine, observation.candidate.payload.get("state_id"))
+        if state is not None:
+            actual_states.append(state)
+    root_state_id = None
+    if observations:
+        root_state_id = observations[0].candidate.payload.get("root_state_id")
+    elif expander.root is not None:
+        root_state_id = expander.root.state_id
     return {
-        "requested": requested,
-        "strategy": strategy,
-        "rng_seed": rng_seed,
+        "requested": int(expander.requested),
+        "strategy": expander.strategy,
+        "rng_seed": int(expander.rng_seed),
         "include_root": bool(args.warmup_include_root),
         "updates_seed": bool(args.warmup_updates_seed),
-        "root_state_id": root.state_id,
+        "root_state_id": root_state_id,
         "state_ids": [state.state_id for state in actual_states],
-        "generated_state_ids": [state.state_id for state in generated_states],
-        "scores": scores,
+        "generated_state_ids": [
+            state.state_id
+            for state in actual_states
+            if not state.metrics.get("warmup_root")
+        ],
+        "scores": [state.score for state in actual_states],
         "score_key": engine.config.score_key,
-        "real_evaluations": real_evaluations,
-        "buffer_size_before": buffer_size_before,
-        "buffer_size_after": len(buffer_entries),
-        "gp_after": gp_after,
+        "real_evaluations": len(observations),
+        "buffer_size_before": int(buffer_size_before),
+        "buffer_size_after": int(buffer_size_before) + len(actual_states),
+        "gp_after": {},
         "actual_states": actual_states,
     }
 
 
-def append_state_to_buffer(
-    state: SearchState,
+def _iteration_records_from_expander(
+    expander_records: list[dict[str, Any]],
+    engine_result,
+    engine: SearchEngine,
     args: argparse.Namespace,
-    *,
-    iteration: int,
-    run_name: str,
-    score_key: str,
-    buffer_path: Path,
-    run_buffer_path: Path,
-    buffer_entries: list[BufferEntry],
+    buffer_entries: list[Any],
     logger: RunLogger,
-    label: str,
-) -> BufferEntry | None:
-    entry = make_buffer_entry(
-        state,
-        args,
-        iteration=iteration,
-        run_name=run_name,
-        score_key=score_key,
-    )
-    if entry is None:
-        logger.write(
-            f"{label} state={state.state_id} buffer_append=skipped "
-            f"status={state.status} score={state.score}"
+) -> list[dict[str, Any]]:
+    """Rebuild model-based iteration records from expander rounds + engine observations."""
+    observations_by_round: dict[int, list[Any]] = {}
+    for observation in engine_result.state.observations:
+        if observation.round_idx is None:
+            continue
+        observations_by_round.setdefault(int(observation.round_idx), []).append(observation)
+    records: list[dict[str, Any]] = []
+    running_best: float | None = None
+    buffer_at: int | None = None
+    for expander_record in expander_records:
+        round_observations = observations_by_round.get(
+            int(expander_record.get("round_idx", 0)), []
         )
-        return None
-    append_buffer_entry(buffer_path, entry, mirror_path=run_buffer_path)
-    buffer_entries.append(entry)
-    logger.write(
-        f"{label} state={state.state_id} {score_key}={entry.score} "
-        f"buffer_size={len(buffer_entries)}"
-    )
-    return entry
+        actual_states: list[SearchState] = []
+        for observation in round_observations:
+            if not observation.evaluation.succeeded:
+                continue
+            state = state_from_id(engine, observation.candidate.payload.get("state_id"))
+            if state is not None:
+                actual_states.append(state)
+        selected_state = expander_record.get("_selected_state")
+        selected_real_score = None
+        if selected_state is not None:
+            for observation in round_observations:
+                if (
+                    observation.evaluation.succeeded
+                    and observation.candidate.payload.get("state_id") == selected_state.state_id
+                ):
+                    selected_real_score = observation.evaluation.metrics.get(
+                        engine.config.score_key
+                    )
+                    break
+        iteration_best = best_score_from_states(
+            actual_states, minimize=engine.config.minimize
+        )
+        best_after = updated_best_score(
+            running_best, iteration_best, minimize=engine.config.minimize
+        )
+        running_best = best_after
+        previous_best = expander_record.get("previous_best_score")
+        score_delta = None
+        if (
+            selected_real_score is not None
+            and finite_score(selected_real_score)
+            and previous_best is not None
+        ):
+            score_delta = float(selected_real_score) - float(previous_best)
+        if buffer_at is None:
+            buffer_at = int(expander_record.get("buffer_size_before_iteration", 0))
+        buffer_at += len(actual_states)
+        gp_after: dict[str, Any] = {}
+        try:
+            gp_after = GPSurrogate(
+                buffer_entries[:buffer_at],
+                lengthscale=args.gp_lengthscale,
+                noise=args.gp_noise,
+                prior_score=args.prior_score,
+                prior_std=args.prior_std,
+                minimize=engine.config.minimize,
+            ).summary()
+        except Exception as exc:  # pragma: no cover - defensive GP replay
+            logger.write(f"gp_after replay failed iteration={expander_record.get('iteration')} {exc}")
+        records.append({
+            "iteration": expander_record["iteration"],
+            "method": expander_record["method"],
+            "root_state_id": expander_record["root_state_id"],
+            "selected_state_id": expander_record["selected_state_id"],
+            "selected_surrogate_score": expander_record.get("selected_surrogate_score"),
+            "selected_pred": expander_record.get("selected_pred"),
+            "selected_std": expander_record.get("selected_std"),
+            "selected_ei": expander_record.get("selected_ei"),
+            "selected_real_score": selected_real_score,
+            "score_key": expander_record["score_key"],
+            "previous_best_score": previous_best,
+            "iteration_best_score": iteration_best,
+            "best_score_after_iteration": best_after,
+            "selected_score_delta_vs_previous_best": score_delta,
+            "selected_improved_previous_best": (
+                None
+                if selected_real_score is None or previous_best is None
+                else is_better(
+                    selected_real_score,
+                    previous_best,
+                    minimize=engine.config.minimize,
+                )
+            ),
+            "gp_before": expander_record.get("gp_before", {}),
+            "gp_after": gp_after,
+            "generated_count": expander_record.get("generated_count", 0),
+            "buffer_size_before_iteration": expander_record.get(
+                "buffer_size_before_iteration", 0
+            ),
+            "buffer_size_after_iteration": buffer_at,
+            "real_evaluations": len(actual_states),
+            "actual_state_ids": [state.state_id for state in actual_states],
+            "actual_states": actual_states,
+            "selected_state": selected_state,
+        })
+    return records
 
 
 async def run_inner_surrogate_search(
@@ -3508,6 +3272,11 @@ def unpack_plain_operation_tool_call(tool_call: Any) -> tuple[str, dict[str, Any
         return "", None
     function = tool_call.get("function")
     name = tool_call.get("name")
+    # Some local/plain-text models emit `tool_name` instead of the OpenAI
+    # `name`/`function.name` key; accept it as an alias so their proposals
+    # parse instead of failing with "operation 1 uses unknown parameter ''".
+    if not name and isinstance(tool_call.get("tool_name"), str):
+        name = tool_call["tool_name"]
     arguments = tool_call.get("arguments")
     if isinstance(function, dict):
         name = function.get("name") or name

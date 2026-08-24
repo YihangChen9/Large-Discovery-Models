@@ -1,4 +1,4 @@
-"""LDMEngine campaign assembly for mutation-effect predictor search."""
+"""Shared-campaign assembly for mutation-effect predictor search."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ldm_tts.campaign import CampaignBudget, CampaignRecipe, CampaignRequest, run_campaign
 from ldm_tts.contracts import (
     AcquisitionSpec,
     CandidateDomainSpec,
@@ -19,7 +20,6 @@ from ldm_tts.contracts import (
     ResponseSpaceSpec,
 )
 from ldm_tts.data import DataCollectionSink
-from ldm_tts.engine import LDMEngine, LDMEngineConfig, LDMEngineState
 from ldm_tts.engine.run_store import CampaignRuntime, atomic_json_write, unique_run_dir
 from ldm_tts.optimization.gp import RBFGPUCBSelector
 from ldm_tts.registration.experiment import (
@@ -197,32 +197,33 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = (
         args.resume_from.resolve()
         if args.resume_from is not None
-        else unique_run_dir(args.out_dir / (args.run_name or "mock"))
-    )
-    runtime = CampaignRuntime.open(
-        run_dir,
-        task=TASK_ID,
-        config=_jsonable_args(args),
-        task_spec=spec,
-        budget_limits=_derived_budget(args),
-        contract_snapshot=None if contract is None else contract.to_dict(),
-        contract_sha256="" if contract is None else contract.digest,
-        contract_profile=profile_name,
-        resume=args.resume_from is not None,
+        else unique_run_dir(args.out_dir.resolve() / (args.run_name or "mock"))
     )
     if contract is not None and args.resume_from is None:
         snapshot_experiment_contract(contract, run_dir, profile=profile_name)
 
+    budget = CampaignBudget(
+        rounds=args.iterations,
+        reservoir_size=args.reservoir_size,
+        batch_size=args.evaluations_per_round,
+        extra_limits={
+            "llm_requests": args.iterations if args.proposal_mode == "openai" else 0,
+            "proposal_attempts": args.iterations if args.proposal_mode == "openai" else 0,
+            "benchmark_jobs": args.iterations
+            * args.evaluations_per_round
+            * (1 if args.mock else len(OFFICIAL_ASSAYS)),
+        },
+    )
+
     client = None
     if args.proposal_mode == "openai":
         if not args.llm_url or not args.llm_model_name:
-            runtime.pause(
-                "paused_endpoint_unavailable",
-                phase="endpoint_preflight",
-                message="OpenAI proposal mode requires an endpoint URL and model name.",
+            _pause_campaign(
+                run_dir, spec, args,
+                "paused_endpoint_unavailable", "endpoint_preflight",
+                "OpenAI proposal mode requires an endpoint URL and model name.",
+                payload,
             )
-            payload.update(run_dir=str(run_dir.resolve()), status="paused_endpoint_unavailable")
-            print(json.dumps(payload, indent=2, sort_keys=True))
             return 2
         client = OpenAICompatibleProposalClient(
             url=args.llm_url,
@@ -239,33 +240,27 @@ def main(argv: list[str] | None = None) -> int:
         )
         try:
             preflight = client.preflight()
-            runtime.record("endpoint_preflight_succeeded", preflight)
-            payload["endpoint_preflight"] = preflight
         except Exception as exc:
-            runtime.pause(
-                "paused_endpoint_unavailable",
-                phase="endpoint_preflight",
-                message=str(exc),
+            _pause_campaign(
+                run_dir, spec, args,
+                "paused_endpoint_unavailable", "endpoint_preflight",
+                str(exc),
+                payload,
                 details={"model": args.llm_model_name},
             )
-            payload.update(run_dir=str(run_dir.resolve()), status="paused_endpoint_unavailable")
-            print(json.dumps(payload, indent=2, sort_keys=True))
             return 2
+        payload["endpoint_preflight"] = preflight
+        _preflight_record = preflight
+    else:
+        _preflight_record = None
 
     sink = DataCollectionSink.from_env(default_root=run_dir / "ldm_data")
     domain = MutationPredictorCandidateDomain(sink)
     expander = (
-        EndpointPredictorExpander(
-            client,
-            before_request=lambda: runtime.consume("llm_requests"),
-        )
+        EndpointPredictorExpander(client)
         if client is not None
         else DeterministicPredictorExpander(collectable=bool(args.mock))
     )
-    state = None
-    if args.resume_from is not None:
-        checkpoint = runtime.load_checkpoint()
-        state = None if checkpoint is None else LDMEngineState.from_checkpoint(checkpoint)
     encoder = PredictorSpecEncoder()
     selector = RBFGPUCBSelector(
         objective_name=spec.objectives[0].name,
@@ -285,7 +280,6 @@ def main(argv: list[str] | None = None) -> int:
             if value is None
         ]
         if missing:
-            runtime.fail("Real evaluation requires " + ", ".join(missing) + ".")
             raise SystemExit("Real evaluation requires " + ", ".join(missing))
         evaluator = MLSBenchMutationEvaluator(
             upstream_root=args.upstream_root,
@@ -295,40 +289,76 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.evaluation_timeout,
             evaluator_python=args.evaluator_python or os.sys.executable,
         )
-    engine = LDMEngine(
-        task_spec=spec,
-        expander=expander,
-        candidate_domain=domain,
-        evaluator=evaluator,
-        runtime=runtime,
-        surrogate_encoder=encoder,
-        selector=selector,
-    )
     try:
-        result = engine.run(
-            LDMEngineConfig(
-                iterations=args.iterations,
-                reservoir_size=args.reservoir_size,
-                evaluations_per_round=args.evaluations_per_round,
+        result = run_campaign(
+            CampaignRequest(
+                run_dir=run_dir,
+                budget=budget,
+                config=_jsonable_args(args),
+                resume=args.resume_from is not None,
+                contract_sha256="" if contract is None else contract.digest,
+                contract_profile=profile_name,
+                context={"assays": list(OFFICIAL_ASSAYS), "profile": profile_name},
+                artifact_projector=_materialize_search_artifacts,
+                runtime_hook=(
+                    lambda runtime: setattr(
+                        expander,
+                        "before_request",
+                        lambda: runtime.consume("llm_requests"),
+                    )
+                    if client is not None
+                    else None
+                ),
             ),
-            state=state,
-            context={"assays": list(OFFICIAL_ASSAYS), "profile": profile_name},
+            CampaignRecipe(
+                task_spec=spec,
+                expander=expander,
+                candidate_domain=domain,
+                evaluator=evaluator,
+                surrogate_encoder=encoder,
+                selector=selector,
+            ),
         )
     except EndpointRequestError as exc:
-        runtime.pause(
-            "paused_endpoint_unavailable",
-            phase="reservoir_expansion",
-            message=str(exc),
+        _pause_campaign(
+            run_dir, spec, args,
+            "paused_endpoint_unavailable", "reservoir_expansion",
+            str(exc),
+            payload,
             details={"model": args.llm_model_name},
         )
-        payload.update(run_dir=str(run_dir.resolve()), status="paused_endpoint_unavailable")
-        print(json.dumps(payload, indent=2, sort_keys=True))
         return 2
-    _materialize_search_artifacts(runtime)
-    payload["engine_summary"] = result.summary
+    if _preflight_record is not None:
+        result.runtime.record("endpoint_preflight_succeeded", _preflight_record)
+    payload["engine_summary"] = result.engine.summary
     payload["run_dir"] = str(run_dir.resolve())
     print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0 if result.summary["successful_evaluation_count"] else 1
+    return 0 if result.engine.summary["successful_evaluation_count"] else 1
+
+
+def _pause_campaign(
+    run_dir: Path,
+    spec: LDMTaskSpec,
+    args: argparse.Namespace,
+    status: str,
+    phase: str,
+    message: str,
+    payload: dict[str, Any],
+    *,
+    details: dict[str, Any] | None = None,
+) -> None:
+    """Persist a resumable pause outside the shared campaign lifecycle."""
+    runtime = CampaignRuntime.open(
+        run_dir,
+        task=TASK_ID,
+        config=_jsonable_args(args),
+        task_spec=spec,
+        budget_limits=None,
+        resume=(run_dir / "campaign.json").exists(),
+    )
+    runtime.pause(status, phase=phase, message=message, details=details)
+    payload.update(run_dir=str(run_dir.resolve()), status=status)
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -346,22 +376,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--evaluation-timeout must be in (0, 3540]")
 
 
-def _derived_budget(args: argparse.Namespace) -> dict[str, int]:
-    selected = args.iterations * args.evaluations_per_round
-    return {
-        "outer_iterations": args.iterations,
-        "llm_requests": args.iterations if args.proposal_mode == "openai" else 0,
-        "proposal_attempts": args.iterations if args.proposal_mode == "openai" else 0,
-        "valid_search_candidates": args.iterations * args.reservoir_size,
-        "selected_candidates": selected,
-        "external_evaluations": selected,
-        "expensive_evaluation_attempts": selected,
-        "successful_evaluations": selected,
-        "benchmark_jobs": selected * (1 if args.mock else len(OFFICIAL_ASSAYS)),
-    }
-
-
-def _materialize_search_artifacts(runtime: CampaignRuntime) -> None:
+def _materialize_search_artifacts(runtime: CampaignRuntime, engine_result=None) -> None:
+    del engine_result  # reserved for projector signature compatibility
     events = runtime.events()
     atomic_json_write(
         runtime.run_dir / "search_manifest.json",

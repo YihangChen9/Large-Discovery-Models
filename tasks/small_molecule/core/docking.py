@@ -3132,7 +3132,15 @@ def prepare_ligand(
     try:
         from meeko import MoleculePreparation, PDBQTWriterLegacy
 
-        setups = MoleculePreparation().prepare(mol)
+        # Meeko treats rings >= min_ring_size (default 7) as macrocycles and
+        # breaks them, injecting "glue" pseudo atoms typed G0/CG0/CG1 etc.
+        # The legacy AutoDock Vina 1.1.2 binary rejects those atom types
+        # ("CG0 is not a valid AutoDock type"), which surfaces as
+        # "non-finite objective score after retries" in campaign evaluations.
+        # Keeping macrocycles rigid avoids the ring-breaking glue atoms so the
+        # written ligand PDBQT only contains classic AD4 atom types.
+        prep = MoleculePreparation(rigid_macrocycles=True)
+        setups = prep.prepare(mol)
         if len(setups) != 1:
             raise RuntimeError(f"Meeko produced {len(setups)} ligand setups; expected one.")
         pdbqt, success, error = PDBQTWriterLegacy.write_string(setups[0])

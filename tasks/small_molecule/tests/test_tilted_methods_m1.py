@@ -7,7 +7,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from tasks.small_molecule.core.ldm_tilted_case2.config import TiltedLDMCase2Config
-from tasks.small_molecule.core.ldm_tilted_case2.loop import run_tilted_case2_search
 from tasks.small_molecule.core.ldm_tilted_case2.methods.direct_llm import (
     LLM_DIRECT_CHUNK_SIZE,
     M1_MAX_PARALLEL_LLM_CALLS,
@@ -168,7 +167,9 @@ def test_m1_stratified_llm_only_selects_llm_order_without_ehvi(monkeypatch, tmp_
     def fail_ehvi(*_args, **_kwargs):
         raise AssertionError("LLM-only method must not call BO/EHVI")
 
-    monkeypatch.setattr("tasks.small_molecule.core.ldm_tilted_case2.loop.compute_ehvi_for_candidates", fail_ehvi)
+    monkeypatch.setattr(
+        "tasks.small_molecule.core.engine_adapters.compute_ehvi_for_candidates", fail_ehvi
+    )
 
     client = MockLLMClient(
         scripted_responses=[
@@ -186,18 +187,29 @@ def test_m1_stratified_llm_only_selects_llm_order_without_ehvi(monkeypatch, tmp_
         budget=2,
         batch_size=1,
         m1_k_direct_llm=1,
-        trajectory_dir=str(tmp_path),
     )
 
-    history, summary = run_tilted_case2_search(
-        ["CCO"],
-        scorer=(lambda smiles: [-1.0 for _ in smiles], lambda smiles: [6.0 for _ in smiles]),
-        analog_fn=lambda _seeds: [],
-        config=cfg,
-        llm=client,
-        rng=RNG(0),
+    # Drive the engine assembly directly: the LLM-only method runs without a
+    # selector, so the engine evaluates candidates in reservoir (LLM) order.
+    from tasks.small_molecule.core import engine_adapters
+    from ldm_tts.engine import LDMEngine, LDMEngineConfig, LDMEngineState
+    from ldm_tts.engine.run_store import CampaignRuntime
+    from tasks.small_molecule.tests.test_tilted_loop import run_campaign
+
+    result, summary, _runtime = run_campaign(
+        cfg,
+        client,
+        tmp_path,
+        seeds=("CCO",),
+        vina=lambda smiles: [-1.0 for _ in smiles],
+        activity=lambda smiles: [6.0 for _ in smiles],
+        analog=lambda _seeds: [],
     )
 
+    history = [
+        (observation.candidate.payload["smiles"], observation.evaluation.metrics)
+        for observation in result.state.observations
+    ]
     assert history[-1][0] == "CCN"
     assert summary["method"] == "m1_stratified_direct_llm_only"
     assert summary["history_size"] == 2

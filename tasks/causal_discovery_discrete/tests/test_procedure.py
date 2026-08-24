@@ -74,7 +74,7 @@ def test_upstream_pin_and_twenty_iteration_profile() -> None:
     assert OFFICIAL_COMMIT == "cfd57a7e0139c72753e32e31bca593719b098717"
     assert TASK_PATH == "tasks/causal-discovery-discrete"
     contract = load_experiment_contract(Path(__file__).resolve().parents[1] / "experiment.json")
-    assert contract.qualification == "draft"
+    assert contract.qualification == "qualified"
     profile = validate_profile_args(contract, "official_campaign_20_iterations", {"iterations": 20, "reservoir-size": 4, "evaluations-per-round": 1, "proposal-mode": "deterministic", "acquisition-beta": 1.0, "evaluation-timeout": 3540})
     assert profile.budget["benchmark_jobs"] == 100
     with pytest.raises(ExperimentContractError):

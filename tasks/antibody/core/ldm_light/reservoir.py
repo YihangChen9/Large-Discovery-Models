@@ -297,6 +297,7 @@ def select_with_policy_reservoir(
     batch_size: int,
     reduction: str,
     args: Any,
+    select_candidates: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     import torch
 
@@ -382,13 +383,16 @@ def select_with_policy_reservoir(
         raise RuntimeError("Policy reservoir produced no valid candidates")
 
     selection_score_key = acq_name if str(args.selection_score) == "acq" else f"bias+{acq_name}"
-    selected_indices, probabilities = select_by_acquisition(
-        [record[selection_score_key] for record in representatives],
-        batch_size=batch_size,
-        reduction=reduction,
-        eta=float(args.softmax_eta),
-        rng=np.random.default_rng(int(seed) + iteration),
-    )
+    selected_indices: list[int] = []
+    probabilities: list[float] = []
+    if select_candidates:
+        selected_indices, probabilities = select_by_acquisition(
+            [record[selection_score_key] for record in representatives],
+            batch_size=batch_size,
+            reduction=reduction,
+            eta=float(args.softmax_eta),
+            rng=np.random.default_rng(int(seed) + iteration),
+        )
     selected: list[dict[str, Any]] = []
     for index in selected_indices:
         record = representatives[index]

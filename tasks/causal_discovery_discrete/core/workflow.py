@@ -1,4 +1,4 @@
-"""LDMEngine campaign assembly for discrete causal discovery."""
+"""Shared-campaign assembly for discrete causal discovery."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ldm_tts.campaign import CampaignBudget, CampaignRecipe, CampaignRequest, run_campaign
 from ldm_tts.contracts import (
     AcquisitionSpec,
     CandidateDomainSpec,
@@ -19,7 +20,6 @@ from ldm_tts.contracts import (
     ResponseSpaceSpec,
 )
 from ldm_tts.data import DataCollectionSink
-from ldm_tts.engine import LDMEngine, LDMEngineConfig, LDMEngineState
 from ldm_tts.engine.reporting import build_campaign_result, build_trajectory_rows, load_successful_observations, write_trajectory_csv
 from ldm_tts.engine.run_store import CampaignRuntime, atomic_json_write, unique_run_dir
 from ldm_tts.optimization.gp import RBFGPUCBSelector
@@ -130,33 +130,17 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     run_dir = args.resume_from.resolve() if args.resume_from else unique_run_dir(args.out_dir / (args.run_name or "mock"))
-    runtime = CampaignRuntime.open(
-        run_dir,
-        task=TASK_ID,
-        config=_jsonable_args(args),
-        task_spec=spec,
-        budget_limits=_derived_budget(args),
-        contract_snapshot=contract.to_dict(),
-        contract_sha256=contract.digest,
-        contract_profile=profile_name,
-        resume=args.resume_from is not None,
-    )
     if args.resume_from is None:
         snapshot_experiment_contract(contract, run_dir, profile=profile_name)
     sink = DataCollectionSink.from_env(default_root=run_dir / "ldm_data")
     domain = CausalAlgorithmCandidateDomain(sink)
     expander = DeterministicCausalExpander(collectable=bool(args.mock))
-    state = None
-    if args.resume_from is not None:
-        checkpoint = runtime.load_checkpoint()
-        state = None if checkpoint is None else LDMEngineState.from_checkpoint(checkpoint)
     encoder = CausalSpecEncoder()
     selector = RBFGPUCBSelector(objective_name=spec.objectives[0].name, beta=args.acquisition_beta, feature_version=FEATURE_VERSION)
     if args.mock:
         evaluator = MockCausalEvaluator()
     else:
         if args.upstream_root is None:
-            runtime.fail("Real evaluation requires --upstream-root.")
             raise SystemExit("Real evaluation requires --upstream-root")
         evaluator = MLSBenchCausalEvaluator(
             upstream_root=args.upstream_root,
@@ -164,25 +148,41 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.evaluation_timeout,
             evaluator_python=args.evaluator_python or os.sys.executable,
         )
-    engine = LDMEngine(
-        task_spec=spec,
-        expander=expander,
-        candidate_domain=domain,
-        evaluator=evaluator,
-        runtime=runtime,
-        surrogate_encoder=encoder,
-        selector=selector,
+    result = run_campaign(
+        CampaignRequest(
+            run_dir=run_dir,
+            budget=CampaignBudget(
+                rounds=args.iterations,
+                reservoir_size=args.reservoir_size,
+                batch_size=args.evaluations_per_round,
+                extra_limits={
+                    "llm_requests": 0,
+                    "proposal_attempts": 0,
+                    "benchmark_jobs": args.iterations
+                    * args.evaluations_per_round
+                    * (1 if args.mock else len(OFFICIAL_CASES)),
+                },
+            ),
+            config=_jsonable_args(args),
+            resume=args.resume_from is not None,
+            context={"cases": list(OFFICIAL_CASES), "profile": profile_name},
+            artifact_projector=lambda runtime, engine_result: _materialize_artifacts(
+                runtime, objective=spec.objectives[0].name
+            ),
+        ),
+        CampaignRecipe(
+            task_spec=spec,
+            expander=expander,
+            candidate_domain=domain,
+            evaluator=evaluator,
+            surrogate_encoder=encoder,
+            selector=selector,
+        ),
     )
-    result = engine.run(
-        LDMEngineConfig(iterations=args.iterations, reservoir_size=args.reservoir_size, evaluations_per_round=args.evaluations_per_round),
-        state=state,
-        context={"cases": list(OFFICIAL_CASES), "profile": profile_name},
-    )
-    _materialize_artifacts(runtime, objective=spec.objectives[0].name)
-    payload["engine_summary"] = result.summary
+    payload["engine_summary"] = result.engine.summary
     payload["run_dir"] = str(run_dir.resolve())
     print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0 if result.summary["successful_evaluation_count"] else 1
+    return 0 if result.engine.summary["successful_evaluation_count"] else 1
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -196,21 +196,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--acquisition-beta must be non-negative")
     if not 0 < args.evaluation_timeout <= 3540:
         raise SystemExit("--evaluation-timeout must be in (0, 3540]")
-
-
-def _derived_budget(args: argparse.Namespace) -> dict[str, int]:
-    selected = args.iterations * args.evaluations_per_round
-    return {
-        "outer_iterations": args.iterations,
-        "llm_requests": 0,
-        "proposal_attempts": 0,
-        "valid_search_candidates": args.iterations * args.reservoir_size,
-        "selected_candidates": selected,
-        "external_evaluations": selected,
-        "expensive_evaluation_attempts": selected,
-        "successful_evaluations": selected,
-        "benchmark_jobs": selected * (1 if args.mock else len(OFFICIAL_CASES)),
-    }
 
 
 def _materialize_artifacts(runtime: CampaignRuntime, *, objective: str) -> None:

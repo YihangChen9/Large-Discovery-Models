@@ -517,7 +517,7 @@ def describe_ldm_task(
             dimension_policy="fixed" if method_spec["uses_acquisition"] else "none",
             dimension=seq_len if method_spec["uses_acquisition"] else None,
             encoder=(
-                "tasks.antibody.core.antbo.bo.custom_init.StandardTransform"
+                "tasks.antibody.core.engine_adapters.AntibodySurrogateEncoder"
                 if method_spec["uses_acquisition"]
                 else ""
             ),

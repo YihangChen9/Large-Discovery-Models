@@ -1,4 +1,11 @@
-"""Shared BO/SIR loop for tilted case2 M1 methods."""
+"""Shared BO/SIR loop for tilted case2 M1 methods.
+
+Deprecated as a campaign entrypoint: the small-molecule task now runs through
+``ldm_tts.engine.LDMEngine`` with the adapters in
+``tasks.small_molecule.core.engine_adapters``. This module retains the pure
+scoring/resampling helpers used by those adapters and the legacy tests; do not
+call :func:`run_tilted_case2_search` from new code.
+"""
 
 from __future__ import annotations
 

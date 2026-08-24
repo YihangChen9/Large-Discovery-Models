@@ -238,10 +238,17 @@ def test_upstream_provenance_is_loaded_once_and_artifacts_are_run_relative(
 
 
 def test_real_budget_counts_all_three_official_jobs() -> None:
-    from tasks.ai4bio_mutation_effect_prediction.core.workflow import _derived_budget
+    from ldm_tts.campaign import CampaignBudget
 
-    args = parse_args(["--iterations", "1", "--reservoir-size", "4"])
-    assert _derived_budget(args)["benchmark_jobs"] == 3
+    from tasks.ai4bio_mutation_effect_prediction.core.evaluator import OFFICIAL_ASSAYS
+
+    budget = CampaignBudget(
+        rounds=1,
+        reservoir_size=4,
+        batch_size=1,
+        extra_limits={"benchmark_jobs": 1 * 1 * len(OFFICIAL_ASSAYS)},
+    )
+    assert budget.runtime_limits()["benchmark_jobs"] == 3
 
 
 def test_official_campaign_profile_locks_budget_and_search_topology() -> None:

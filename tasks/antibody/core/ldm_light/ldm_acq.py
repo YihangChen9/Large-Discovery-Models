@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""LLM DSL proposal + parallel acquisition selector baseline for AntBO.
+"""Antibody campaign through the shared LDM-TTS engine.
 
-After an initial LLM-only warmup, the LLM proposes search atoms (LocalSearch,
-NeighborSampling, LatinHyperCubeSampling, Or). The existing LDM parallel search
-executor expands those atoms into candidates, scores them with a GP acquisition
-function, and only the argmax/top-k are sent to Absolut.
+The warmup/proposal/acquisition/scoring components remain below (direct batch
+proposal, policy reservoirs, GP acquisition, Absolut evaluation), but the
+campaign loop now runs through ``ldm_tts.engine.LDMEngine`` with the adapters
+in ``tasks.antibody.core.engine_adapters``. ``run_one`` assembles one engine
+campaign per (antigen, seed) and re-exports ``results.csv`` and
+``llm_acq_decisions.jsonl`` from the engine events.
 """
 from __future__ import annotations
 
@@ -37,6 +39,12 @@ WORKSPACE_ROOT = ROOT.parent.parent
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
+from ldm_tts.campaign import (
+    CampaignBudget,
+    CampaignRecipe,
+    CampaignRequest,
+    run_campaign,
+)
 from ldm_tts.engine.run_store import JsonlTrajectoryRecorder
 from ldm_tts.optimization.acquisition import SINGLE_OBJECTIVE_ACQUISITIONS, make_acquisition
 from ldm_tts.data import DataCollectionSink, make_complete_design_ir
@@ -546,6 +554,7 @@ def select_with_parallel_ldm(
     antigen_context: dict[str, Any] | None,
     batch_size: int,
     args: argparse.Namespace,
+    select_candidates: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Use LDM's parallel executor: LLM DSL -> execute_atoms -> acquisition argmax."""
     import torch
@@ -592,7 +601,7 @@ def select_with_parallel_ldm(
 
     score_key = f"bias+{acq_name}"
     ranked = sorted(range(len(results)), key=lambda i: results[i][score_key], reverse=True)
-    selected_indices = ranked[:batch_size]
+    selected_indices = ranked[:batch_size] if select_candidates else []
     selected_candidates: list[dict[str, Any]] = []
     for idx in selected_indices:
         item = results[idx]
@@ -1154,185 +1163,84 @@ def run_one(config: dict[str, Any], antigen: str, seed: int, args: argparse.Name
     observed: set[str] = set()
     rows: list[dict[str, Any]] = []
     eval_idx = 0
+    del observed, rows, eval_idx  # history is rebuilt from engine observations
 
-    while eval_idx < args.n_evals:
-        batch_size = min(args.batch_size, args.n_evals - eval_idx)
-        start = time.time()
-        initialized = len(rows) >= int(args.n_init)
-        using_acquisition = initialized and bool(method_spec["uses_acquisition"])
+    from tasks.antibody.core import engine_adapters
 
-        if initialized and method_spec["base_measure"] == "policy":
-            from tasks.antibody.core.ldm_light.reservoir import select_with_policy_reservoir
-
-            selected_candidates, decision = select_with_policy_reservoir(
-                llm=llm,
-                rows=rows,
-                antigen=antigen,
-                seed=seed,
-                iteration=eval_idx,
-                antigen_context=antigen_context,
-                batch_size=batch_size,
-                reduction=str(method_spec["reduction"]),
-                args=args,
-            )
-            candidates = decision["representatives"]
-            selected_indices = decision["selected_indices"]
-            acquisition_details = decision["representatives"]
-            selector_source = decision["source"]
-        elif initialized and method_spec["base_measure"] == "direct" and method_spec["uses_acquisition"]:
-            from tasks.antibody.core.ldm_light.direct import select_direct_with_acquisition
-
-            selected_candidates, decision = select_direct_with_acquisition(
-                llm=llm,
-                rng=rng,
-                acquisition_rng=acquisition_rng,
-                antigen=antigen,
-                seq_len=seq_len,
-                observed=observed,
-                rows=rows,
-                antigen_context=antigen_context,
-                batch_size=batch_size,
-                reduction=str(method_spec["reduction"]),
-                args=args,
-            )
-            candidates = decision["candidates"]
-            selected_indices = decision["selected_indices"]
-            acquisition_details = decision["candidates"]
-            selector_source = decision["source"]
-        elif initialized and method_spec["base_measure"] == "legacy_policy":
-            assert orchestrator is not None
-            selected_candidates, decision = select_with_parallel_ldm(
-                orchestrator=orchestrator,
-                rows=rows,
-                antigen=antigen,
-                seed=seed,
-                iteration=eval_idx,
-                antigen_context=antigen_context,
-                batch_size=batch_size,
-                args=args,
-            )
-            candidates = decision["parallel_results"]
-            selected_indices = decision["selected_indices"]
-            acquisition_details = decision["parallel_results"]
-            selector_source = decision["source"]
-        elif method == "legacy_policy_max":
-            candidates, decision = propose(
-                llm=llm,
-                rng=rng,
-                antigen=antigen,
-                seq_len=seq_len,
-                batch_size=batch_size,
-                observed=observed,
-                rows=rows,
-                candidate_library=candidate_library,
-                antigen_context=antigen_context,
-                args=args,
-            )
-            selected_indices = list(range(min(batch_size, len(candidates))))
-            selected_candidates = [candidates[index] for index in selected_indices]
-            acquisition_details = []
-            selector_source = decision.get("source", "llm_pool_rerank")
-        else:
-            from tasks.antibody.core.ldm_light.direct import propose_direct_batch
-
-            candidates, decision = propose_direct_batch(
-                llm=llm,
-                rng=rng,
-                antigen=antigen,
-                seq_len=seq_len,
-                n=batch_size,
-                observed=observed,
-                rows=rows,
-                antigen_context=antigen_context,
-                args=args,
-                independent=False,
-            )
-            selected_indices = list(range(min(batch_size, len(candidates))))
-            selected_candidates = [candidates[index] for index in selected_indices]
-            acquisition_details = []
-            decision["phase"] = "generation" if method == "llm_gen" else "initialization"
-            selector_source = method if method == "llm_gen" else f"{method}_init"
-
-        proposed_seqs = [candidate["sequence"] for candidate in selected_candidates]
-        llm_scores = [candidate.get("score") for candidate in selected_candidates]
-        selected_acq_scores = [
-            candidate.get("acquisition_score") for candidate in selected_candidates
-        ]
-        collect_direct_sequence_action(
-            data_sink,
-            decision=decision,
-            selected_candidates=selected_candidates,
-            rows=rows,
-            observed=observed,
-            antigen=antigen,
-            antigen_context=antigen_context,
-            seq_len=seq_len,
-            history_top_k=int(args.history_top_k),
-            seed=seed,
-            eval_start=eval_idx,
-            method=method,
+    sink = DataCollectionSink.from_env(default_root=run_dir / "ldm_data")
+    domain = engine_adapters.AntibodyCandidateDomain(seq_len)
+    expander = engine_adapters.AntibodyReservoirExpander(
+        method=method,
+        method_spec=method_spec,
+        antigen=antigen,
+        seed=seed,
+        seq_len=seq_len,
+        args=args,
+        llm=llm,
+        rng=rng,
+        acquisition_rng=acquisition_rng,
+        antigen_context=antigen_context,
+        orchestrator=orchestrator,
+        candidate_library=candidate_library,
+        sink=sink,
+        run_dir=run_dir,
+    )
+    evaluator_adapter = engine_adapters.AntibodyEvaluator(evaluator)
+    encoder = None
+    selector = None
+    if bool(method_spec["uses_acquisition"]):
+        encoder = engine_adapters.AntibodySurrogateEncoder(seq_len)
+        selector = engine_adapters.AntibodyGPSelector(
+            args=args, method_spec=method_spec, rng=acquisition_rng
+        )
+    task_spec = describe_ldm_task(args, config, antigen)
+    recipe = CampaignRecipe(
+        task_spec=task_spec,
+        expander=expander,
+        candidate_domain=domain,
+        evaluator=evaluator_adapter,
+        surrogate_encoder=encoder,
+        selector=selector,
+    )
+    iterations = -(-int(args.n_evals) // int(args.batch_size))
+    campaign = run_campaign(
+        CampaignRequest(
             run_dir=run_dir,
-        )
-        values, evaluated_seqs = evaluator.energy(seqs_to_indices(proposed_seqs))
-        elapsed = time.time() - start
-
-        old_idx = eval_idx
-        eval_idx, best_value, _ = append_results(
-            rows=rows,
-            values=values,
-            seqs=evaluated_seqs,
-            llm_scores=llm_scores,
-            acquisition_scores=selected_acq_scores,
-            elapsed_s=elapsed,
-            source=selector_source,
-            acquisition_used=using_acquisition,
-            start_idx=eval_idx,
-        )
-        observed.update(evaluated_seqs)
-
-        for row in rows[old_idx:eval_idx]:
-            print(
-                f"[{antigen} seed={seed} eval={row['Index'] + 1}/{args.n_evals}] "
-                f"y={row['LastValue']:.4f} best={best_value:.4f} "
-                f"seq={row['LastProtein']} llm_score={row['LLMScore']} "
-                f"acq={row['AcquisitionScore']} source={row['Source']}",
-                flush=True,
-            )
-
-        decision_recorder.append_round({
-            "eval_start": old_idx,
-            "eval_end": eval_idx,
-            "antigen": antigen,
-            "seed": seed,
-            "method": method,
-            "parallel_budget": int(args.parallel_budget) if using_acquisition else batch_size,
-            "candidates": candidates,
-            "acquisition": {
-                "enabled": bool(method_spec["uses_acquisition"]),
-                "used": bool(using_acquisition),
-                "name": acq_name,
-                "beta": acq_beta,
-                "xi": acq_xi,
-                "n_init": args.n_init,
-                "reduction": method_spec["reduction"],
-                "softmax_eta": float(getattr(args, "softmax_eta", 1.0)),
-                "parallel_executor": (
-                    "tasks.antibody.core.ldm.acquisition.parallel_search.execute_atoms"
-                    if using_acquisition and method_spec["base_measure"] in {"policy", "legacy_policy"}
-                    else None
-                ),
-                "scores": acquisition_details,
-                "selected_indices": selected_indices,
-                "selected_candidates": selected_candidates,
-            },
-            "decision": decision,
-            "pool_csv": pool_csv,
-        })
-        pd.DataFrame(rows).to_csv(results_path, index=False)
+            config=_jsonable_args(args),
+            budget=CampaignBudget(
+                rounds=iterations,
+                reservoir_size=max(1, int(args.parallel_budget)),
+                batch_size=int(args.batch_size),
+                target_observations=int(args.n_evals),
+                max_evaluation_attempts=int(args.n_evals),
+                max_empty_reservoir_rounds=max(iterations, 1),
+            ),
+            artifact_projector=lambda runtime, result: engine_adapters.materialize_legacy_run(
+                runtime,
+                result,
+                run_dir,
+                antigen=antigen,
+                seed=seed,
+                method=method,
+                method_spec=method_spec,
+                args=args,
+                decision_recorder=decision_recorder,
+            ),
+        ),
+        recipe,
+    )
+    result = campaign.engine
 
     if hasattr(llm, "close"):
         llm.close()
     return run_dir
+
+
+def _jsonable_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
 
 
 def main() -> None:
