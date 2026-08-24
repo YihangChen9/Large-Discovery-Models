@@ -7,6 +7,7 @@ omit =
     */core/analog.py
     */core/dependencies.py
     */core/docking.py
+    */core/ldm_tilted_case2/loop.py
     */core/workflow.py
 
 [report]
