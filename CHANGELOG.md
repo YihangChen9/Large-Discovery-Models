@@ -16,6 +16,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Integrity verification and trust documentation for the external G12D joblib
   model artifact.
 - Automatic manifest-declared dependency preflight before non-mock runs.
+- Slime as an RL submodule (`rl/slime`) plus a task-neutral RL environment
+  (`rl/ldm_rl`) that maps one LDM campaign to one RL episode: policy candidate
+  proposals are actions, evaluation feedback is the observation, and objective
+  improvement is the reward. Includes mock-mode factories for the
+  `ai4bio_mutation_effect_prediction` and `causal_discovery_discrete` tasks,
+  a Slime custom generate/reward bridge, and engine-parity tests.
 
 ### Changed
 
@@ -28,6 +34,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Removed the protein inverse-folding task until its public contract and
   dependencies are ready.
 - Corrected stale module paths and local-only artifact metadata.
+- Small-molecule real runs: keep macrocycles rigid during Meeko ligand
+  preparation so the legacy AutoDock Vina 1.1.2 binary no longer rejects the
+  ring-breaking "glue" atom types (G0/CG0/CG1) that Meeko injects by default;
+  those rejections previously surfaced as "non-finite objective score after
+  retries" and wasted most of the evaluation budget.
+- Small-molecule real runs: scale the engine `proposal_attempts` limit by the
+  number of LLM chunks per reservoir round so the stratified direct-LLM
+  reservoir plus its refill loops no longer exhaust the proposal budget before
+  the target number of successful evaluations completes.
 
 ### Removed
 

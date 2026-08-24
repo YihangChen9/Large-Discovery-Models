@@ -28,12 +28,15 @@ Read [references/built-in-tasks.md](references/built-in-tasks.md) when running
    README. Also read `experiment.json` when present. Confirm that the config's
    `task` matches the intended task.
 4. Classify the runtime implementation:
-   - **Engine-native**: the executed task path constructs `LDMEngine`; expect
+   - **Engine-native**: the executed task path calls
+     `ldm_tts.campaign.run_campaign` with a `CampaignRecipe`; expect
      the shared lifecycle, budget, event, checkpoint, status, and summary
-     artifacts.
-   - **Compatibility**: the task uses a task-specific loop or
-     `run_budgeted_search`; follow its README for artifacts, counters, and
-     resume behavior.
+     artifacts. All built-in tasks (`nanogpt`, `small_molecule`, `antibody`,
+     `llm_kv_adaptive_quantization`, `causal_discovery_discrete`,
+     `ai4bio_mutation_effect_prediction`) are engine-native.
+   - **Compatibility**: only legacy or experimental tasks use a task-specific
+     loop or `run_budgeted_search`; follow their README for artifacts, counters,
+     and resume behavior.
    - Emitting `LDMTaskSpec` does not by itself make a task engine-native. Verify
      the executed code path rather than inferring runtime ownership from names.
 5. Classify the requested execution level:
@@ -130,7 +133,9 @@ or cancellation responses as idempotent.
 
 For an engine-native run, inspect `ldm_task_spec.json`, `events.jsonl`,
 `checkpoint.json`, `budget.json`, `status.json`, and `summary.json`. When a
-qualified contract is active, also inspect `experiment_contract.json`. For a
+qualified contract is active, also inspect `experiment_contract.json`. Built-in
+tasks also re-export their historical trajectory files (see
+[references/built-in-tasks.md](references/built-in-tasks.md)). For a
 compatibility run, inspect the task-specific artifacts named by its README and
 do not claim shared-engine resume or budget semantics unless the executed path
 actually provides them.

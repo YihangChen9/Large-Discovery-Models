@@ -122,33 +122,50 @@ Every `ReservoirExpansionSpec.response_space` must name a declared
 `ResponseSpaceSpec`. At least one expansion action must produce candidates;
 schema-only actions cannot form a runnable task by themselves.
 
-New procedures should dispatch into `LDMEngine` with task-owned behavioral
-adapters under `core/`:
+New procedures should run the campaign through the shared
+`ldm_tts.campaign.run_campaign` algorithm with task-owned behavioral adapters
+under `core/`:
 
 ```python
-engine = LDMEngine(
-    task_spec=describe_ldm_task(args),
-    expander=task_expander,
-    candidate_domain=task_candidate_domain,
-    evaluator=task_evaluator,
-    runtime=campaign_runtime,
-    surrogate_encoder=task_encoder,  # optional with selector
-    selector=task_selector,           # optional with encoder
+result = run_campaign(
+    CampaignRequest(
+        run_dir=run_dir,
+        budget=CampaignBudget(
+            rounds=iterations,
+            reservoir_size=reservoir_size,
+            batch_size=evaluations_per_round,
+            target_observations=iterations * evaluations_per_round,
+        ),
+        config=jsonable_args,
+        resume=resume_requested,
+        artifact_projector=materialize_task_artifacts,  # optional legacy exports
+    ),
+    CampaignRecipe(
+        task_spec=describe_ldm_task(args),
+        expander=task_expander,
+        candidate_domain=task_candidate_domain,
+        evaluator=task_evaluator,
+        surrogate_encoder=task_encoder,  # optional, paired with selector
+        selector=task_selector,          # optional, paired with encoder
+    ),
 )
-result = engine.run(engine_config)
 ```
 
 Candidate admission returns `Candidate` or `CandidateRejection`; external
-evaluation returns `EvaluationResult`. The engine is responsible for reservoir
-deduplication, observation construction, objective validation, budget checks,
-events, checkpoints, failure classification, and summaries. Task code must not
-duplicate those policies around the engine.
+evaluation returns `EvaluationResult`. The shared campaign algorithm is
+responsible for runtime creation, reservoir deduplication, observation
+construction, objective validation, budget enforcement, events, checkpoints,
+failure classification, and summaries. Task code must not open
+`CampaignRuntime`, assemble budget ledgers, or duplicate those policies around
+the campaign.
 
 Do not treat emitting `LDMTaskSpec` or importing shared optimization helpers as
-an engine migration. A task is engine-native only when its executed campaign
-constructs `LDMEngine` and delegates lifecycle ownership to it. When repairing a
-legacy task, identify compatibility paths explicitly and migrate them without
-silently changing budgets, artifacts, or resume behavior.
+a campaign migration. A task is engine-native only when its executed campaign
+runs through `run_campaign` (or constructs `LDMEngine` directly when a
+specialized lifecycle is required) and delegates lifecycle ownership to the
+shared algorithm. When repairing a legacy task, identify compatibility paths
+explicitly and migrate them without silently changing budgets, artifacts, or
+resume behavior.
 
 The runner applies config environment variables, changes to the task directory,
 imports the conventional module, and calls `main(argv)`. The task owns all
@@ -213,8 +230,9 @@ the task README must state why and identify the future accepted-action boundary.
 - Mock dependency check passes without external systems.
 - Mock runner dry-run resolves the registered module and task directory.
 - Mock runner execution succeeds.
-- Mock execution traverses `LDMEngine` and writes campaign, event, checkpoint,
-  status, budget, task-spec, and summary artifacts.
+- Mock execution runs through the shared campaign algorithm and writes
+  campaign, event, checkpoint, status, budget, task-spec, and summary
+  artifacts.
 - Shared tests and `git diff --check` pass.
 - The mock collection test emits valid `ldm-2.0` IR, or the task documents why
   its response contract is not collectable.

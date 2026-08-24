@@ -225,8 +225,11 @@ Action types:
 
 ## Small Molecule Collection
 
-Small-molecule runtime collection is already hooked into
-[tasks/small_molecule/core/ldm_tilted_case2/trace.py](../tasks/small_molecule/core/ldm_tilted_case2/trace.py).
+Small-molecule runtime collection is hooked into the engine campaign export at
+[tasks/small_molecule/core/engine_adapters.py](../tasks/small_molecule/core/engine_adapters.py);
+the round-record extraction reuses
+[tasks/small_molecule/core/ldm_tilted_case2/trace.py](../tasks/small_molecule/core/ldm_tilted_case2/trace.py)'s
+IR builder helpers.
 
 Enable it with:
 

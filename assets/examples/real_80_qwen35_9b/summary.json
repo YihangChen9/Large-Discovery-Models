@@ -1,0 +1,48 @@
+{
+  "drop_counts": {
+    "duplicate": 4921,
+    "evaluated": 2607,
+    "invalid": 471,
+    "overlength": 7
+  },
+  "early_stop_reason": "successful_evaluation_target",
+  "engine": {
+    "expansion_schema": {},
+    "failed_evaluation_count": 0,
+    "next_round": 80,
+    "observation_count": 80,
+    "pareto_candidate_ids": [
+      "mol-e4e0f8d053e1",
+      "mol-569d992e7197",
+      "mol-737bf8c4bf31",
+      "mol-1d1854e262ea",
+      "mol-1dee45bd71f7"
+    ],
+    "rounds_run": 80,
+    "stop_reason": "successful_evaluation_target",
+    "successful_evaluation_count": 80,
+    "task": "small_molecule"
+  },
+  "expansion_schema": {},
+  "failed_evaluation_count": 0,
+  "final_hypervolume": 18.454103269569543,
+  "history_size": 80,
+  "llm_call_count": 1931,
+  "method": "m1_stratified_direct_llm_oversample_sir",
+  "next_round": 80,
+  "observation_count": 80,
+  "pareto_candidate_ids": [
+    "mol-e4e0f8d053e1",
+    "mol-569d992e7197",
+    "mol-737bf8c4bf31",
+    "mol-1d1854e262ea",
+    "mol-1dee45bd71f7"
+  ],
+  "prob_effective_sample_size": 1.851026602388025,
+  "q0_entropy": 4.286531666402972,
+  "round_count": 80,
+  "rounds_run": 80,
+  "stop_reason": "successful_evaluation_target",
+  "successful_evaluation_count": 80,
+  "task": "small_molecule"
+}

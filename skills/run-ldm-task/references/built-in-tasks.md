@@ -19,10 +19,22 @@ execution. Runner `--dry-run` validates config resolution and any selected
 experiment profile. A task-level `args.dry-run=true`, zero-iteration mode, or
 similar option enters the task adapter and may write diagnostic artifacts.
 
-The built-in tasks emit `LDMTaskSpec` and reuse shared `ldm_tts` components, but
-they currently retain task-specific or compatibility execution loops. Do not
-expect the complete `LDMEngine` artifact and resume contract unless the executed
-task path actually constructs `LDMEngine`.
+All built-in tasks call `ldm_tts.campaign.run_campaign`; its internal
+`LDMEngine` implementation owns the campaign lifecycle. Every executed campaign writes the shared
+`campaign.json` / `events.jsonl` / `checkpoint.json` / `summary.json` /
+`budget.json` / `status.json` artifact set. Tasks additionally re-export their
+historical trajectory files from engine events:
+
+- `nanogpt`: `model_based_summary.json`, `summary.json` (merged with
+  `engine_summary`), `model_based_buffer.jsonl`, `states/`.
+- `small_molecule`: `history.json`, `rounds.jsonl`, and legacy summary fields
+  merged into `summary.json`.
+- `antibody`: `results.csv`, `llm_acq_decisions.jsonl`, and legacy summary
+  fields merged into `summary.json`.
+
+Resume goes through the engine checkpoint (`checkpoint.json`); `small_molecule`
+additionally accepts a legacy `history.json`/`rounds.jsonl` directory when no
+campaign manifest exists.
 
 When a config selects `contract_profile`, do not override locked budget or
 method arguments. Use a checked-in smoke profile, or follow a task README that
@@ -54,10 +66,12 @@ run; its diagnostic recipe explicitly clears `contract_profile` before changing
 those values. Real evaluation requires prepared data/tokenizer artifacts and
 the task's training dependency group.
 
-The current nanoGPT workflow is a compatibility runtime built around its
-task-specific search engine. Inspect its run directory and
-`model_based_summary.json`/`summary.json` rather than assuming all shared-engine
-artifacts exist.
+The nanoGPT campaign runs through `run_campaign`: warm-up and each model-based
+iteration are engine rounds. The task emits the surrogate-scored proposal pool,
+the engine invokes selection, and all real evaluations, budgets, events, and
+checkpoints belong to the shared campaign algorithm.
+Inspect `events.jsonl` / `summary.json` for the shared contract and
+`model_based_summary.json` for the task's iteration records.
 
 ## Small Molecule
 
@@ -78,9 +92,11 @@ The real profile locks `budget`, `batch-size`, and `acq`. Follow
 `contract_profile` before reducing the budget. `--no-optional` may omit ReaSyn
 checks only when the selected direct method cannot call ReaSyn.
 
-The current loop uses the shared compatibility `run_budgeted_search` API and
-task-specific trajectory files. Inspect the task README and run summary for its
-actual resume and artifact contract.
+The small-molecule campaign runs through `run_campaign`: the tilted EHVI/SIR
+reservoir search lives in the task's expander and acquisition-selector adapters
+(`tasks/small_molecule/core/engine_adapters.py`), and the engine owns budget,
+events, checkpoints, and summaries. `history.json` / `rounds.jsonl` remain as
+event re-exports for downstream tooling.
 
 ## Antibody
 
@@ -104,6 +120,8 @@ budget, initialization count, parallel budget, and CPU device. Do not recreate
 that smoke run by overriding `real_lcb.yaml`; reserve `real_lcb.yaml` for the
 larger unprofiled run described by the task README.
 
-The current antibody workflow is task-specific. Inspect its resolved run
-directory, decision trajectory, results, and summary as documented by the task;
-do not infer `LDMEngine` lifecycle semantics from its emitted `LDMTaskSpec`.
+The antibody campaign runs through `run_campaign`: one engine campaign per
+(antigen, seed) pair, with the warmup/proposal/GP-acquisition components
+adapted into the task's expander and selector
+(`tasks/antibody/core/engine_adapters.py`). `results.csv` and
+`llm_acq_decisions.jsonl` remain as event re-exports.

@@ -1,0 +1,147 @@
+{
+  "antigen": "1ADQ_A",
+  "best_sequence": "YMSLINLICIV",
+  "best_value": -99.0,
+  "engine": {
+    "expansion_schema": {},
+    "failed_evaluation_count": 0,
+    "incumbent": {
+      "candidate": {
+        "candidate_id": "ab-87cf8aa2b38a",
+        "canonical_key": "YMSLINLICIV",
+        "metadata": {
+          "acquisition_score": 1.5686211585998535,
+          "acquisition_used": true,
+          "llm_score": null,
+          "phase": "policy",
+          "selector_source": "policy_max"
+        },
+        "payload": {
+          "acquisition_raw": 1.5686211585998535,
+          "acquisition_score": 1.5686211585998535,
+          "mu": -1.9029451608657837,
+          "score": null,
+          "sequence": "YMSLINLICIV",
+          "sigma": 0.16716496646404266,
+          "source": "policy_1"
+        },
+        "source": "policy_max"
+      },
+      "evaluation": {
+        "artifacts": {},
+        "candidate_id": "ab-87cf8aa2b38a",
+        "error": "",
+        "metadata": {
+          "sequence": "YMSLINLICIV"
+        },
+        "metrics": {
+          "absolut_energy": -99.0
+        },
+        "resource_usage": {
+          "benchmark_jobs": 1.0
+        },
+        "status": "succeeded"
+      },
+      "metadata": {},
+      "round_idx": 25,
+      "surrogate": {
+        "metadata": {
+          "sequence": "YMSLINLICIV"
+        },
+        "source_id": "ab-87cf8aa2b38a",
+        "values": [
+          19.0,
+          10.0,
+          15.0,
+          9.0,
+          7.0,
+          11.0,
+          9.0,
+          7.0,
+          1.0,
+          7.0,
+          17.0
+        ],
+        "version": "antbo_categorical_sequence_v1"
+      }
+    },
+    "next_round": 80,
+    "observation_count": 80,
+    "rounds_run": 80,
+    "stop_reason": "observation_target",
+    "successful_evaluation_count": 80,
+    "task": "antibody"
+  },
+  "evaluated": 80,
+  "expansion_schema": {},
+  "failed_evaluation_count": 0,
+  "incumbent": {
+    "candidate": {
+      "candidate_id": "ab-87cf8aa2b38a",
+      "canonical_key": "YMSLINLICIV",
+      "metadata": {
+        "acquisition_score": 1.5686211585998535,
+        "acquisition_used": true,
+        "llm_score": null,
+        "phase": "policy",
+        "selector_source": "policy_max"
+      },
+      "payload": {
+        "acquisition_raw": 1.5686211585998535,
+        "acquisition_score": 1.5686211585998535,
+        "mu": -1.9029451608657837,
+        "score": null,
+        "sequence": "YMSLINLICIV",
+        "sigma": 0.16716496646404266,
+        "source": "policy_1"
+      },
+      "source": "policy_max"
+    },
+    "evaluation": {
+      "artifacts": {},
+      "candidate_id": "ab-87cf8aa2b38a",
+      "error": "",
+      "metadata": {
+        "sequence": "YMSLINLICIV"
+      },
+      "metrics": {
+        "absolut_energy": -99.0
+      },
+      "resource_usage": {
+        "benchmark_jobs": 1.0
+      },
+      "status": "succeeded"
+    },
+    "metadata": {},
+    "round_idx": 25,
+    "surrogate": {
+      "metadata": {
+        "sequence": "YMSLINLICIV"
+      },
+      "source_id": "ab-87cf8aa2b38a",
+      "values": [
+        19.0,
+        10.0,
+        15.0,
+        9.0,
+        7.0,
+        11.0,
+        9.0,
+        7.0,
+        1.0,
+        7.0,
+        17.0
+      ],
+      "version": "antbo_categorical_sequence_v1"
+    }
+  },
+  "method": "policy_max",
+  "n_evals": 80,
+  "next_round": 80,
+  "observation_count": 80,
+  "rounds_run": 80,
+  "seed": 42,
+  "stop_reason": "observation_target",
+  "successful_evaluation_count": 80,
+  "task": "antibody"
+}

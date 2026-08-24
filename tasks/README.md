@@ -150,14 +150,15 @@ acquisition, and evaluators belong in `core/`. Versioned schemas and seed
 inputs belong in `resources/`.
 
 New tasks should implement mock and real campaigns through
-`ldm_tts.engine.LDMEngine`. The generated `core/mock_engine.py` demonstrates the
-minimum behavioral adapters: `ReservoirExpander`, `CandidateDomainAdapter`, and
+`ldm_tts.campaign.run_campaign`. Supply a `CampaignRecipe` with the minimum
+behavioral adapters: `ReservoirExpander`, `CandidateDomainAdapter`, and
 `CandidateEvaluator`. Add `SurrogateEncoder` plus `AcquisitionSelector` only
 when the task uses surrogate-guided selection. Keep the procedure adapter
 limited to CLI parsing, `LDMTaskSpec` construction, dependency preparation, and
-engine dispatch.
+campaign dispatch; do not open `CampaignRuntime` or assemble budget ledgers in
+task workflows.
 
-The engine creates authoritative `Candidate`, `EvaluationResult`, and
+The campaign algorithm creates authoritative `Candidate`, `EvaluationResult`, and
 `Observation` records. Do not introduce task-local equivalents unless the task
 payload needs a private intermediate record behind an engine adapter. Use
 `CampaignRuntime` for run identity, contract snapshots, budgets, events,

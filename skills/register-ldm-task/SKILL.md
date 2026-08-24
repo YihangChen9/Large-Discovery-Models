@@ -54,11 +54,13 @@ and real evaluator checks support `qualified`.
    scientific provenance, proposal-provider capabilities, metric roles,
    evaluator settings, limits, and named runner-enforced campaign profiles in
    `experiment.json`.
-6. Implement the campaign through `ldm_tts.engine.LDMEngine`. Supply task-owned
-   `ReservoirExpander`, `CandidateDomainAdapter`, and `CandidateEvaluator`
-   adapters. Add `SurrogateEncoder` and `AcquisitionSelector` only for
-   surrogate-guided methods. Use `CampaignRuntime` for budgets, events,
-   checkpoints, status, and summaries; use `ProposalClient` for model transport.
+6. Implement the campaign through `ldm_tts.campaign.run_campaign`. Supply a
+   `CampaignRecipe` with task-owned `ReservoirExpander`,
+   `CandidateDomainAdapter`, and `CandidateEvaluator` adapters. Add
+   `SurrogateEncoder` and `AcquisitionSelector` only for surrogate-guided
+   methods. Declare absolute budgets with `CampaignBudget`; do not open
+   `CampaignRuntime` or assemble budget ledgers in task code. Use
+   `ProposalClient` for model transport.
    Reuse `ldm_tts.optimization.search`, `ldm_tts.optimization.gp`, and
    `ldm_tts.optimization.acquisition`
    behind those adapters before adding task-local infrastructure.
@@ -143,10 +145,11 @@ evaluator rather than a standalone benchmark agent.
   select enforced production settings with top-level `contract_profile`.
 - Define `main(argv)`, `parse_args`, and a runtime-faithful `describe_ldm_task`.
 - Do not call a task engine-native merely because it emits `LDMTaskSpec`; the
-  executed campaign must construct `LDMEngine` and delegate lifecycle ownership
-  to it.
-- Make the deterministic mock execute at least one complete `LDMEngine` round
-  and assert that `events.jsonl`, `checkpoint.json`, and `summary.json` exist.
+  executed campaign must run through `run_campaign` and delegate lifecycle
+  ownership to the shared campaign algorithm.
+- Make the deterministic mock execute at least one complete shared-campaign
+  round and assert that `events.jsonl`, `checkpoint.json`, and `summary.json`
+  exist.
 - Count LLM calls, valid search states, selected candidates, expensive attempts,
   successful evaluations, benchmark jobs, and outer iterations separately.
 - Serialize every declared budget counter, including zeros, and preserve true

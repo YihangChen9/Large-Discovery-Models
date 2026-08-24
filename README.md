@@ -510,10 +510,12 @@ parsing, trajectory metadata, and common tests in one place. Task adapters keep
 domain-specific dependencies such as training data, Vina, ReaSyn, and Absolut
 behind task boundaries.
 
-### LDM Engine
+### LDM Campaign Algorithm
 
-`ldm_tts.engine.LDMEngine` is the task-neutral runtime counterpart to
-`LDMTaskSpec`. It executes the lifecycle declared by the task contract:
+`ldm_tts.campaign.run_campaign` is the deep task-neutral interface for an
+experiment. A caller supplies one `CampaignRecipe` containing only the
+scientific adapters and one `CampaignBudget`; the shared implementation uses
+`LDMEngine` internally to execute the lifecycle declared by `LDMTaskSpec`:
 
 ```text
 reservoir expansion
@@ -524,9 +526,10 @@ reservoir expansion
   -> durable campaign checkpoint
 ```
 
-The engine owns lifecycle policy, budget enforcement, failure classification,
-event recording, checkpoints, and summaries. A task supplies adapters at the
-scientific seams:
+The campaign algorithm owns runtime creation, exact partial batches,
+successful-result targets, failed-evaluation replacement, lifecycle policy,
+budget enforcement, failure classification, event recording, checkpoints,
+resume, and summaries. A task supplies adapters at the scientific seams:
 
 | Interface | Task-owned responsibility | Shared implementation |
 | --- | --- | --- |
@@ -538,9 +541,13 @@ scientific seams:
 
 `CampaignRuntime` writes a common `campaign.json`, `budget.json`, `status.json`,
 `events.jsonl`, `checkpoint.json`, `ldm_task_spec.json`, and `summary.json`
-contract. New task scaffolds execute their deterministic mock through this
-engine. Existing workflows remain supported and can migrate adapter by adapter
-without changing their registered task IDs or historical artifacts.
+contract. Every built-in task — `nanogpt`, `small_molecule`, `antibody`,
+`llm_kv_adaptive_quantization`, `causal_discovery_discrete`, and
+`ai4bio_mutation_effect_prediction` — calls the shared campaign interface and
+delegates lifecycle ownership to it; the tasks keep exporting their historical
+trajectory files (for example `small_molecule`'s `history.json`/`rounds.jsonl`
+and `antibody`'s `results.csv`/`llm_acq_decisions.jsonl`) from engine events so
+downstream tooling keeps working.
 
 The declarative and behavioral layers deliberately stay separate:
 `ReservoirExpansionSpec` describes what a task permits, while a
