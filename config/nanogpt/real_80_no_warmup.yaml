@@ -1,0 +1,31 @@
+name: nanogpt_real_operation_tool_80_no_warmup
+task: nanogpt
+algorithm: best_of_n
+mode: real
+description: nanoGPT operation-tool 80-iteration model-based real run, skipping warmup and reusing the persistent GP warmup buffer.
+args:
+  train-file: resources/train/real_train.py
+  operation-schema: resources/schemas/real_operations.json
+  generator: operation_tool
+  method: best_of_n
+  breadth: 1
+  depth: 1
+  iterations: 80
+  warmup: 0
+  seed-policy: best
+  buffer: runs/ablation_buffer/expanded_exp1/gp_warmup.jsonl
+  initial-expansion-parameters: 5
+  max-expansion-parameters: 0
+  disable-expansion-schema-updates: false
+  allow-new-expansion-parameters: false
+  surrogate-mode: lcb
+  gp-beta: 1.0
+  gp-xi: 0.001
+  out-dir: runs
+  run-name: "{name}"
+  eval-command: "{repo_root}/tasks/nanogpt/.venv/bin/python {train_path}"
+  llm-url: null
+  llm-model-name: null
+  api-key: null
+  temperature: 0.7
+  max-tokens: 8192

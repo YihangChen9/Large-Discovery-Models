@@ -1,0 +1,35 @@
+name: antibody_real_campaign_1adq_ucb_80
+task: antibody
+algorithm: ucb
+mode: real
+description: 1ADQ_A policy-max UCB campaign with 80 real Absolut evaluations (20 init + 60 UCB selections).
+args:
+  config: resources/default_config.yaml
+  antigen: 1ADQ_A
+  method: policy_max
+  seed: 42
+  n-trials: 1
+  budget: 80
+  batch-size: 1
+  n-init: 20
+  n-strategies: 5
+  planner-mode: choices
+  parallel-budget: 600
+  per-strategy-budget: 0
+  pool-score: acq
+  selection-score: acq
+  bias-weight: 0.05
+  sample-timeout-s: 5.0
+  device: cpu
+  acq: ucb
+  acq-beta: 2.0
+  acq-xi: 0.001
+  llm-temperature: 0.25
+  llm-max-tokens: 4096
+  disable-thinking: true
+  timeout-s: 120
+  max-retries: 3
+  history-top-k: 20
+  include-antigen-context: true
+  fallback-random: true
+  out-dir: runs/real_campaign_1adq_ucb_80
