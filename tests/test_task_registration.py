@@ -121,8 +121,8 @@ def test_scaffolded_task_is_discoverable_and_valid(tmp_path: Path) -> None:
     mock_engine = (
         tmp_path / "tasks" / "protein_design" / "core" / "mock_engine.py"
     ).read_text(encoding="utf-8")
-    assert "LDMEngine" in mock_engine
-    assert "CampaignRuntime" in mock_engine
+    assert "run_campaign" in mock_engine
+    assert "CampaignRecipe" in mock_engine
     assert "DraftCandidateDomain" in mock_engine
 
 

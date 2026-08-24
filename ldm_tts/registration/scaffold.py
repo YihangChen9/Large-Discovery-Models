@@ -188,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
             iterations=max(0, args.iterations),
             run_dir=run_dir,
         )
-        payload["engine_summary"] = result.summary
+        payload["engine_summary"] = result.engine.summary
         payload["run_dir"] = str(run_dir.resolve())
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
@@ -200,13 +200,19 @@ if __name__ == "__main__":
 
 
 def _mock_engine_template(task_id: str) -> str:
-    return f'''"""Deterministic LDMEngine smoke adapter for ``{task_id}``."""
+    return f'''"""Deterministic shared-campaign smoke adapter for ``{task_id}``."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from ldm_tts.engine.run_store import CampaignRuntime
+from ldm_tts.campaign import (
+    CampaignBudget,
+    CampaignRecipe,
+    CampaignRequest,
+    CampaignResult,
+    run_campaign,
+)
 from ldm_tts.contracts import (
     CallableCandidateEvaluator,
     Candidate,
@@ -214,7 +220,6 @@ from ldm_tts.contracts import (
     LDMTaskSpec,
     RawProposal,
 )
-from ldm_tts.engine import LDMEngine, LDMEngineConfig, LDMEngineResult
 from ldm_tts.engine.expansion import (
     CallableReservoirExpander,
     ExpansionRequest,
@@ -249,29 +254,26 @@ def run_mock_campaign(
     *,
     iterations: int,
     run_dir: Path,
-) -> LDMEngineResult:
-    runtime = CampaignRuntime.open(
-        run_dir,
-        task="{task_id}",
-        config={{"mode": "mock", "iterations": iterations}},
-        task_spec=task_spec,
-        budget_limits={{"external_evaluations": iterations}},
-    )
-    engine = LDMEngine(
-        task_spec=task_spec,
-        expander=CallableReservoirExpander(_expand),
-        candidate_domain=DraftCandidateDomain(),
-        evaluator=CallableCandidateEvaluator(
-            lambda candidate: {{"objective": float(candidate.payload)}}
+) -> CampaignResult:
+    return run_campaign(
+        CampaignRequest(
+            run_dir=run_dir,
+            budget=CampaignBudget(
+                rounds=iterations,
+                reservoir_size=1,
+                batch_size=1,
+                target_observations=iterations,
+            ),
+            config={{"mode": "mock", "iterations": iterations}},
         ),
-        runtime=runtime,
-    )
-    return engine.run(
-        LDMEngineConfig(
-            iterations=iterations,
-            reservoir_size=1,
-            evaluations_per_round=1,
-        )
+        CampaignRecipe(
+            task_spec=task_spec,
+            expander=CallableReservoirExpander(_expand),
+            candidate_domain=DraftCandidateDomain(),
+            evaluator=CallableCandidateEvaluator(
+                lambda candidate: {{"objective": float(candidate.payload)}}
+            ),
+        ),
     )
 '''
 
@@ -367,10 +369,10 @@ uv run --project tasks/{task_id} \\
   python scripts/run_ldm_tts.py config/{task_id}/mock.yaml
 ```
 
-The mock path already exercises the shared `LDMEngine`. Replace the generated
-candidate-domain admission adapter, reservoir expander, evaluator, surrogate
-representation, objective, and response contract before adding a real-run
-config. Complete `experiment.json`
+The mock path already exercises the shared `run_campaign` algorithm. Replace the
+generated candidate-domain admission adapter, reservoir expander, evaluator,
+surrogate representation, objective, and response contract before adding a
+real-run config. Complete `experiment.json`
 with source-pinned benchmark provenance, metric roles, evaluator limits, and a
 named campaign profile. Keep `qualification` set to `draft` until a real seed
 and tiny LDM-selected evaluation pass.
