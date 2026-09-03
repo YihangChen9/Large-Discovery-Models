@@ -4,8 +4,12 @@ Real-mode GRPO on the small-molecule LDM loop. **Train on KRAS G12D** (ready
 evaluator: `best_g12d_model.joblib` + 8UN5), **evaluate on G12C and G12D**.
 **One episode file per run** — each run gets its **own** `gp_history_file` +
 `output_dir` (sharing a GP across runs couples their rewards; see PR #2 / nb 06).
-`config_real.json` default reward is now **hypervolume (ΔHV)**; the acquisition
-variants are kept as an ablation. Two axes, sharing R2 as the pivot:
+**Primary reward is `acquisition` with `n_samples_per_prompt=4`** — measured best
+in PR #2 (using the `std<1e-6` gradient gate, acquisition+n=4 had 0 degenerate
+steps vs ΔHV's ~21%; the ΔHV win was an artifact of a metric blind spot). R3
+keeps ΔHV as an ablation, now with a **fixed** `reward_ref_point` (the moving
+nadir is disabled — it rewarded evaluating bad molecules). Two axes, sharing R2
+as the pivot:
 
 | Run | Model (`MODEL_HF`) | Reward | Episodes file |
 |-----|--------------------|--------|---------------|
@@ -19,8 +23,9 @@ variants are kept as an ablation. Two axes, sharing R2 as the pivot:
 - Seeds: change the **environment** seed by regenerating with
   `python -m ldm_rl.episodes --seed-offset N` (it is an `episodes.py` flag, not a
   slime one); ≥3–5 seeds per run for error bars.
-- With acquisition, watch `zero_std/count_0.0`: if GRPO groups collapse to equal
-  rewards (EHVI decay / collisions), the gradient is zero — prefer ΔHV (R3).
+- Zero-variance is killed by **group size**, not the reward form: `n=4` took
+  acquisition to 0 degenerate steps. Watch the `std<1e-6` gate (the value the
+  advantage actually divides by), not exact-equality `count_0.0`.
 
 ## 0. One-time prep
 ```bash

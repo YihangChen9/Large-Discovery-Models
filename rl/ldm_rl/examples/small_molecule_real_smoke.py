@@ -33,7 +33,9 @@ from tasks.small_molecule.core.workflow import ExpandingMockCase2LLM  # noqa: E4
 
 def main() -> int:
     rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 3
-    reward = sys.argv[2] if len(sys.argv) > 2 else "hypervolume"
+    reward = sys.argv[2] if len(sys.argv) > 2 else "acquisition"
+    # hypervolume needs a fixed oriented-space nadir (moving nadir disabled, PR #2)
+    ref_point = (0.0, 5.0) if reward == "hypervolume" else None
 
     real_kwargs = dict(
         vina_bin=os.environ.get("VINA_BIN", "/mnt/data0/dock-project/bin/vina"),
@@ -58,6 +60,7 @@ def main() -> int:
             reservoir_size=2,
             evaluations_per_round=1,
             reward=reward,
+            reward_ref_point=ref_point,
         ),
         **real_kwargs,
     )

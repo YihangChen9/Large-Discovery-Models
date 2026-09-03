@@ -27,11 +27,17 @@ rk=dict(c['real_kwargs']);rk['gp_history_file']=sys.argv[1];rk['output_dir']=sys
 print(json.dumps(rk))" "$1" "$2"
 }
 
-gen() {  # gen <out.jsonl> <reward> <agg> <count> <iters> <gp_history_file> <output_dir>
+gen() {  # gen <out.jsonl> <reward> <agg> <count> <iters> <gp_history_file> <output_dir> [ref_point]
+  local ref_arg=()
+  [ -n "${8:-}" ] && ref_arg=(--reward-ref-point "$8")   # required for reward=hypervolume
   python3 -m $EP --output "$REPO_ROOT/$1" --task small_molecule --mode real \
     --count "$4" --iterations "$5" --reservoir-size "$RES" --evaluations-per-round "$EVALS" \
-    --reward "$2" --acquisition-agg "$3" --real-kwargs "$(rk_json "$6" "$7")"
+    --reward "$2" --acquisition-agg "$3" "${ref_arg[@]}" --real-kwargs "$(rk_json "$6" "$7")"
 }
+
+# Fixed oriented-space domain nadir for the ΔHV ablation (the moving nadir is
+# disabled; see PR #2). Adjust to your objective orientation if needed.
+HV_REF=${HV_REF:-0,5}
 
 # warm-up (rollout-only) writes the shared BASE GP; each run is then seeded from it.
 gen rl_episodes_sm_warmup.jsonl acquisition max "$WARMUP" "$WARMUP_ITERS" "$BASE_GP" "$OUT_DIR/warmup"
@@ -40,7 +46,7 @@ gen rl_episodes_sm_warmup.jsonl acquisition max "$WARMUP" "$WARMUP_ITERS" "$BASE
 # R1 base / R2 SFT share the acquisition-max reward but stay isolated (own GP).
 gen rl_episodes_sm_R1.jsonl acquisition max  "$COUNT" "$ITERS" "$GP_DIR/R1.jsonl" "$OUT_DIR/R1"
 gen rl_episodes_sm_R2.jsonl acquisition max  "$COUNT" "$ITERS" "$GP_DIR/R2.jsonl" "$OUT_DIR/R2"
-gen rl_episodes_sm_R3.jsonl hypervolume max  "$COUNT" "$ITERS" "$GP_DIR/R3.jsonl" "$OUT_DIR/R3"
+gen rl_episodes_sm_R3.jsonl hypervolume max  "$COUNT" "$ITERS" "$GP_DIR/R3.jsonl" "$OUT_DIR/R3" "$HV_REF"
 gen rl_episodes_sm_R4.jsonl acquisition mean "$COUNT" "$ITERS" "$GP_DIR/R4.jsonl" "$OUT_DIR/R4"
 
 echo "episodes -> $REPO_ROOT/rl_episodes_sm_{warmup,R1,R2,R3,R4}.jsonl"

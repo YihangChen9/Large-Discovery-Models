@@ -8,7 +8,14 @@ from ldm_rl.episodes import EpisodeSpec
 
 def test_hypervolume_is_a_policy():
     assert "hypervolume" in REWARD_POLICIES
-    assert EnvConfig(iterations=1, reward="hypervolume").reward == "hypervolume"
+    cfg = EnvConfig(iterations=1, reward="hypervolume", reward_ref_point=(0.0, 5.0))
+    assert cfg.reward == "hypervolume"
+
+
+def test_hypervolume_requires_fixed_ref_point():
+    # The moving per-round nadir is disabled (PR #2): a fixed ref is mandatory.
+    with pytest.raises(ValueError, match="reward_ref_point"):
+        EnvConfig(iterations=1, reward="hypervolume")
 
 
 def test_hv2d_single_point():

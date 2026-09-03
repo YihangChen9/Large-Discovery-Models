@@ -117,6 +117,11 @@ class EnvConfig:
                 f"unknown acquisition_agg {self.acquisition_agg!r}; "
                 f"expected one of {ACQUISITION_AGGS}"
             )
+        if self.reward == "hypervolume" and self.reward_ref_point is None:
+            raise ValueError(
+                "reward 'hypervolume' requires a fixed reward_ref_point "
+                "(oriented-space domain nadir); the moving nadir is disabled (PR #2)."
+            )
 
 
 @dataclass(frozen=True)
@@ -694,8 +699,8 @@ class LDMEnv:
         Reward = HV(front after this round) - HV(front before), clipped at 0.
         Uses measured objective values (unlike ``acquisition``), so it directly
         rewards how much the round pushed the observed Pareto front. Two
-        objectives only; ``reward_ref_point`` (oriented space) fixes the
-        reference, else a per-round nadir is used consistently for before/after.
+        objectives only; requires a fixed ``reward_ref_point`` (oriented-space
+        domain nadir) — the moving per-round nadir is disabled (see PR #2).
         """
 
         if len(self.objectives.specs) != 2:
@@ -717,19 +722,22 @@ class LDMEnv:
 
         after_pts = pts(all_obs)
         before_pts = pts(prior)
-        if self.config.reward_ref_point is not None:
-            ref = (
-                float(self.config.reward_ref_point[0]),
-                float(self.config.reward_ref_point[1]),
+        # A FIXED reference point is required. A per-round moving nadir (min of the
+        # observed points) was tried and is broken: it lets evaluating a bad
+        # molecule lower the reference and pay almost as much as finding a good one
+        # (KangOxford PR #2 measured ΔHV total corr -0.19 with the worst evaluated
+        # molecule), and its eps floor emits ~1e-13 "non-zero" rewards that starve
+        # GRPO of gradient while slipping past the exact-equality zero-variance
+        # counter. Callers must pass a fixed domain nadir via reward_ref_point.
+        if self.config.reward_ref_point is None:
+            raise ValueError(
+                "hypervolume reward requires a fixed reward_ref_point (oriented-space "
+                "domain nadir); the moving per-round nadir is disabled (see PR #2)."
             )
-        elif after_pts:
-            eps = 1e-6
-            ref = (
-                min(p[0] for p in after_pts) - eps,
-                min(p[1] for p in after_pts) - eps,
-            )
-        else:
-            ref = (0.0, 0.0)
+        ref = (
+            float(self.config.reward_ref_point[0]),
+            float(self.config.reward_ref_point[1]),
+        )
         hv_after = self._hypervolume_2d(after_pts, ref)
         hv_before = self._hypervolume_2d(before_pts, ref)
         dhv = max(0.0, hv_after - hv_before)

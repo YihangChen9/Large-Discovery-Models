@@ -1,11 +1,9 @@
 #!/bin/bash
-# One-shot: the ΔHV + n=4 config for PR #2's zero-variance check.
-#
-# What it does, end to end:
-#   1. regenerate per-run episodes (reward=hypervolume via config, own GP/output per run);
-#   2. seed each run's GP from the warm base;
-#   3. launch the SFT + ΔHV run (R3) with n_samples_per_prompt=4.
-# Then watch wandb `rollout/zero_std/count_0.0` — it should drop vs the n=2 / acquisition runs.
+# One-shot for the measured-best config: acquisition + n=4 (PR #2).
+# Properly measured (using the std<1e-6 gate, not exact-equality), acquisition+n=4
+# had 0 degenerate steps vs ΔHV's ~21%, so acquisition is the primary reward and
+# n=4 the group size. Runs R2 = SFT + acquisition, single-node (no cross-node
+# placement split), with the precision-aware optimizer so it fits on one node.
 #
 # ── set these for your cluster (Isambard paths differ from ours) ──────────────
 export REPO_ROOT=${REPO_ROOT:?set REPO_ROOT to the checkout, e.g. /path/to/LDM}
@@ -22,20 +20,20 @@ BASE_GP=$(python3 -c "import json;print(json.load(open('$CONFIG'))['gp_history_f
 
 cd "$REPO_ROOT/rl/slime_launch"
 
-# 1. per-run episodes (config already has reward=hypervolume, kernel=fp, n_samples=4)
+# 1. per-run episodes (config: reward=acquisition, kernel=fp, n_samples=4)
 bash gen_episodes_runs.sh
 
-# 2. seed each run's GP from the warm base (run run_warmup_real_slime.sh first if $BASE_GP is missing)
+# 2. seed each run's GP from the warm base (run run_warmup_real_slime.sh first if missing)
 test -s "$BASE_GP" || { echo "WARN: $BASE_GP missing — run run_warmup_real_slime.sh first"; exit 1; }
 mkdir -p "$REPO_ROOT/rl/gp_history"
 for r in R1 R2 R3 R4; do cp "$BASE_GP" "$REPO_ROOT/rl/gp_history/$r.jsonl"; done
 
-# 3. launch R3 = SFT + ΔHV, n_samples=4  (override N_SAMPLES here without touching config)
+# 3. launch R2 = SFT + acquisition, n=4  (N_SAMPLES overrides config without editing it)
 N_SAMPLES=4 \
 MODEL_HF="$MODEL_HF" MODEL_REF="$MODEL_REF" \
-EPISODES="$REPO_ROOT/rl_episodes_sm_R3.jsonl" \
-SAVE="$REPO_ROOT/rl/qwen3.5-9B_rl_R3_sft_hv_n4" \
-WANDB_RUN=R3_sft_hv_n4 \
+EPISODES="$REPO_ROOT/rl_episodes_sm_R2.jsonl" \
+SAVE="$REPO_ROOT/rl/qwen3.5-9B_rl_R2_sft_acq_n4" \
+WANDB_RUN=R2_sft_acq_n4 \
   bash run_train_real_9b.sh
 
-echo "launched R3 (ΔHV, n=4). Watch wandb rollout/zero_std/count_0.0 and rollout/raw_reward."
+echo "launched R2 (acquisition, n=4). Watch the std<1e-6 gate, raw_reward, and train/grad_norm (nan => update skipped)."

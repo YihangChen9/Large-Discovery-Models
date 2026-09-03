@@ -12,7 +12,7 @@
     "iterations": 20,
     "reservoir_size": 2,
     "evaluations_per_round": 1,
-    "reward": "hypervolume"
+    "reward": "acquisition"
   },
   "training": {
     "num_rollout": 50,
