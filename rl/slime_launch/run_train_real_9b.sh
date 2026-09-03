@@ -15,11 +15,12 @@
 set -ex
 export PYTHONUNBUFFERED=1
 
-REPO_ROOT=/mnt/data0/ys/LDM
-SLIME_ROOT=$REPO_ROOT/rl/slime
-MEGATRON_ROOT=/root/megatron-lm
-CONDA_PREFIX=/root/micromamba/envs/slime
-CONFIG=$REPO_ROOT/rl/slime_launch/config_real.json
+# All paths overridable via env (Isambard / other clusters differ).
+REPO_ROOT=${REPO_ROOT:-/mnt/data0/ys/LDM}
+SLIME_ROOT=${SLIME_ROOT:-$REPO_ROOT/rl/slime}
+MEGATRON_ROOT=${MEGATRON_ROOT:-/root/megatron-lm}
+CONDA_PREFIX=${CONDA_PREFIX:-/root/micromamba/envs/slime}
+CONFIG=${CONFIG:-$REPO_ROOT/rl/slime_launch/config_real.json}
 
 MODEL_HF=${MODEL_HF:-/mnt/data0/hf_models/models/Qwen3.5-9B}
 MODEL_REF=${MODEL_REF:-$REPO_ROOT/rl/qwen3.5-9B_torch_dist}
@@ -41,7 +42,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 jq_get() { python3 -c "import json;print(json.load(open('$CONFIG'))['training']['$1'])"; }
 NUM_ROLLOUT=$(jq_get num_rollout)
 ROLLOUT_BATCH=$(jq_get rollout_batch_size)
-N_SAMPLES=$(jq_get n_samples_per_prompt)
+N_SAMPLES=${N_SAMPLES:-$(jq_get n_samples_per_prompt)}   # env-overridable (e.g. N_SAMPLES=4)
 GLOBAL_BATCH=$(jq_get global_batch_size)
 RESP_LEN=$(jq_get rollout_max_response_len)
 MAX_TOKENS=$(jq_get max_tokens_per_gpu)

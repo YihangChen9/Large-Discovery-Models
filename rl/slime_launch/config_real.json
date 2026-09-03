@@ -17,8 +17,8 @@
   "training": {
     "num_rollout": 50,
     "rollout_batch_size": 2,
-    "n_samples_per_prompt": 2,
-    "global_batch_size": 2,
+    "n_samples_per_prompt": 4,
+    "global_batch_size": 8,
     "rollout_max_response_len": 8192,
     "max_tokens_per_gpu": 8192,
     "rollout_temperature": 0.8,

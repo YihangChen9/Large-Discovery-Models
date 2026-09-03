@@ -5,8 +5,8 @@
 # a GP or output dir across runs couples their rewards and breaks reproducibility
 # (see KangOxford PR #2 / notebook 06). The model is chosen at launch time, not here.
 set -eu
-REPO_ROOT=/mnt/data0/ys/LDM
-CONFIG=$REPO_ROOT/rl/slime_launch/config_real.json
+REPO_ROOT=${REPO_ROOT:-/mnt/data0/ys/LDM}
+CONFIG=${CONFIG:-$REPO_ROOT/rl/slime_launch/config_real.json}
 export PYTHONPATH=$REPO_ROOT/rl:$REPO_ROOT:${PYTHONPATH:-}
 EP=rl.ldm_rl.episodes
 
