@@ -71,3 +71,23 @@ jobs:
       - working-directory: tasks/small_molecule
         run: uv run --locked --group dev python -m pytest --cov --cov-config=.coveragerc --cov-report=term-missing
       - run: CUDA_VISIBLE_DEVICES='' uv run --locked --project tasks/small_molecule python scripts/run_ldm_tts.py config/small_molecule/mock_m1_stratified_oversample.yaml
+
+  glm53-deploy:
+    name: GLM-5.3 deploy invariants (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Standard library only, so this job stays green even when the heavier
+      # ones cannot run.
+      - name: Self-test the checker
+        shell: bash
+        run: python3 ci/check_glm53_deploy.py --self-test
+      - name: Check deploy invariants
+        shell: bash
+        run: python3 ci/check_glm53_deploy.py
+      - name: Shell syntax
+        shell: bash
+        run: for f in deploy/glm53-flash-gh200/*.sh; do bash -n "$f"; done
