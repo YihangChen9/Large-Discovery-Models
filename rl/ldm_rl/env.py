@@ -440,6 +440,13 @@ class LDMEnv:
         incumbent_after = self.objectives.incumbent(self._state.observations) if len(
             self.objectives.specs
         ) == 1 else None
+        # With several objectives `incumbent` is always None, but "there is no
+        # single best" and "nothing has succeeded" are different statements.
+        # Pass the success count to the renderer as well, otherwise the
+        # observation tells the model its work did not count.
+        succeeded_total = sum(
+            1 for o in self._state.observations if o.evaluation.succeeded
+        )
 
         self._state.next_round = round_idx + 1
         truncated = not terminated and self._state.next_round >= self.config.iterations
@@ -455,6 +462,7 @@ class LDMEnv:
             rejections=rejections,
             evaluations=new_observations,
             incumbent=incumbent_after,
+            succeeded_total=succeeded_total,
         )
         info = _jsonable(
             {

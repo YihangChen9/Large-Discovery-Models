@@ -11,6 +11,7 @@ appended to the trajectory with ``loss_mask = 0``.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Sequence
 from typing import Any
 
@@ -40,7 +41,44 @@ def _render_domain(domain: CandidateDomainSpec) -> str:
     return "\n".join(lines)
 
 
-def _render_response_space(space: ResponseSpaceSpec) -> str:
+def _schema_skeleton(schema: Any, *, n_items: int = 2, _depth: int = 0) -> Any:
+    """Build a structurally valid *instance* of ``schema`` (not the schema itself).
+
+    The prompt used to show only the JSON Schema, which every model we tried
+    echoed back in schema *shape* rather than filling in::
+
+        {"properties": {"direct_smiles": {"items": [...]}, "type": "object"}
+        {"direct_smiles": {"items": [...]}, "required": null}
+
+    Both parse-fail against ``bridge.py``'s ``require_list(data, "direct_smiles")``,
+    so every round returned zero candidates, every episode returned reward 0.0,
+    and GRPO then divided by a zero-std reward group -> NaN in the backward pass.
+    A schema tells the model what is *legal*; it does not show what to *emit*.
+    """
+
+    if not isinstance(schema, dict) or _depth > 6:
+        return "..."
+    kind = schema.get("type")
+    if kind == "object":
+        props = schema.get("properties") or {}
+        return {
+            name: _schema_skeleton(sub, n_items=n_items, _depth=_depth + 1)
+            for name, sub in props.items()
+        }
+    if kind == "array":
+        item = schema.get("items") or {}
+        return [
+            _schema_skeleton(item, n_items=n_items, _depth=_depth + 1)
+            for _ in range(max(1, n_items))
+        ]
+    if kind in ("number", "integer"):
+        return 0
+    if kind == "boolean":
+        return False
+    return "..."
+
+
+def _render_response_space(space: ResponseSpaceSpec, *, n_items: int = 2) -> str:
     lines = [f"- Action format: {space.output_kind}"]
     if space.description:
         lines.append(f"- {space.description}")
@@ -48,6 +86,19 @@ def _render_response_space(space: ResponseSpaceSpec) -> str:
         lines.append(
             "- Response schema:\n" + json.dumps(space.schema, indent=2, sort_keys=True)
         )
+        # Showing the schema alone is not enough -- see _schema_skeleton.
+        # Set LDM_RL_NO_SCHEMA_EXAMPLE=1 to reproduce the schema-only prompt.
+        if not os.environ.get("LDM_RL_NO_SCHEMA_EXAMPLE"):
+            try:
+                skeleton = _schema_skeleton(space.schema, n_items=n_items)
+            except Exception:  # noqa: BLE001 - never break prompt rendering
+                skeleton = None
+            if skeleton is not None:
+                lines.append(
+                    "- Emit an INSTANCE of that schema, not the schema. Exact shape:\n"
+                    + json.dumps(skeleton, sort_keys=True)
+                    + '\n  (replace every "..." with your own value; keep the keys and nesting)'
+                )
     return "\n".join(lines)
 
 
@@ -118,8 +169,14 @@ def render_step_observation(
     rejections: Sequence[Any],
     evaluations: Sequence[Any],
     incumbent: Observation | None,
+    succeeded_total: int | None = None,
 ) -> str:
-    """Render the post-step feedback appended to the policy transcript."""
+    """Render the post-step feedback appended to the policy transcript.
+
+    ``succeeded_total`` is the number of successful evaluations so far in this
+    episode. It exists because ``incumbent`` being ``None`` means two very
+    different things, and the old text conflated them (see below).
+    """
 
     lines = [f"<round {round_idx}>"]
     if parse_error:
@@ -151,6 +208,18 @@ def render_step_observation(
             f"  candidate: {_brief_payload(incumbent.candidate.payload)}",
             f"  metrics: {json.dumps(dict(incumbent.metrics), sort_keys=True)}",
         ]
+    elif succeeded_total:
+        # env.py:440 computes an incumbent only for single-objective tasks --
+        # with two objectives there is no single best point, just a Pareto set.
+        # That is correct, but rendering it as "no successful evaluation yet"
+        # states something else entirely, and it is false: on 2026-09-02 a run
+        # showed "mol-3ee8e371814d: SUCCEEDED" and "no successful evaluation
+        # yet" in the same observation, after which the policy stopped emitting
+        # anything at all for the rest of the episode.
+        lines.append(
+            f"Best so far: {succeeded_total} successful evaluation(s); "
+            "no single best with multiple objectives (a Pareto set, not a point)."
+        )
     else:
         lines.append("Best so far: none (no successful evaluation yet).")
     if remaining_rounds > 0:

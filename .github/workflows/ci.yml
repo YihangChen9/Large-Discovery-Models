@@ -71,3 +71,20 @@ jobs:
       - working-directory: tasks/small_molecule
         run: uv run --locked --group dev python -m pytest --cov --cov-config=.coveragerc --cov-report=term-missing
       - run: CUDA_VISIBLE_DEVICES='' uv run --locked --project tasks/small_molecule python scripts/run_ldm_tts.py config/small_molecule/mock_m1_stratified_oversample.yaml
+
+  rollout-invariants:
+    name: Rollout invariants (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Standard library only, so no dependency install: the point of this job
+      # is that it stays green even when the heavier jobs cannot run.
+      - name: Self-test the checker
+        shell: bash
+        run: python3 ci/check_rollout_invariants.py --self-test
+      - name: Check rollout invariants
+        shell: bash
+        run: python3 ci/check_rollout_invariants.py

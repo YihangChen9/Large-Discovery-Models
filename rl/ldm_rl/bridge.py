@@ -21,6 +21,7 @@ Slime installed (unit tests inject fake dependencies instead).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 
@@ -70,6 +71,53 @@ def _apply_chat_template(state: Any, text: str) -> str:
     except Exception:  # noqa: BLE001 - fall back to the untemplated prompt
         return text
     return templated if isinstance(templated, str) and templated.strip() else text
+
+
+_OBS_SENTINEL = "<<<LDM_OBS>>>"
+_PREV_SENTINEL = "<<<LDM_PREV>>>"
+
+
+def _observation_wrapper(state: Any) -> tuple[str, str]:
+    """Return the (prefix, suffix) that make env feedback a proper user turn.
+
+    Environment feedback used to be concatenated straight onto the response,
+    which puts plain text immediately after the policy's end-of-turn marker.
+    For a chat model that is malformed: after `<|im_end|>` the template expects
+    a new role marker, not prose. Round 0 always parsed (its prompt goes
+    through `_apply_chat_template`), and every later round came back with no
+    JSON at all -- 231 unparseable turns against 52 successful evaluations in
+    one measured run.
+
+    The wrapper is derived from the tokenizer's own chat template rather than
+    hardcoded, by rendering an assistant turn followed by a user turn and
+    slicing around the two sentinels. Returns ("", "") when the tokenizer has
+    no chat template, which restores the previous behaviour.
+    """
+
+    tokenizer = getattr(state, "tokenizer", None)
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        return "", ""
+    try:
+        rendered = tokenizer.apply_chat_template(
+            [
+                {"role": "assistant", "content": _PREV_SENTINEL},
+                {"role": "user", "content": _OBS_SENTINEL},
+            ],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+    except Exception:  # noqa: BLE001 - fall back to raw concatenation
+        return "", ""
+    if not isinstance(rendered, str):
+        return "", ""
+    prev_at = rendered.find(_PREV_SENTINEL)
+    obs_at = rendered.find(_OBS_SENTINEL)
+    if prev_at < 0 or obs_at < 0 or obs_at < prev_at:
+        return "", ""
+    return (
+        rendered[prev_at + len(_PREV_SENTINEL) : obs_at],
+        rendered[obs_at + len(_OBS_SENTINEL) :],
+    )
 
 
 async def generate(args, sample, sampling_params, evaluation: bool = False) -> Any:
@@ -172,16 +220,38 @@ async def generate(args, sample, sampling_params, evaluation: bool = False) -> A
                 sample.status = Sample.Status.TRUNCATED
                 break
 
-            step = env.step(cur_response)
+            # Slime schedules the trajectories of one rollout batch with
+            # ``asyncio.gather`` (sglang_rollout.py). ``env.step`` is blocking
+            # I/O -- ``RemoteLDMEnv.step`` writes to a subprocess stdin and
+            # blocks on ``stdout.readline`` -- so calling it directly holds the
+            # event loop for its full duration and every other trajectory in
+            # the batch stops. Measured on this cluster a single ``env.step``
+            # takes 4.09 s (docking dominates) and accounts for ~98% of a
+            # training step, so the loop spends nearly all of its time
+            # serialised on one trajectory.
+            #
+            # Each sample builds its own env above, so there is no shared
+            # state between the threads; the shared GP history file is
+            # guarded by flock in ``rl_real_shared.py``.
+            step = await asyncio.get_running_loop().run_in_executor(
+                None, env.step, cur_response
+            )
             last_step = step
             total_reward += step.reward
             sample.metadata["env_steps"].append(step.info)
 
             if step.observation:
+                # Wrap the feedback as its own user turn, then reopen an
+                # assistant turn. Without this the text lands right after the
+                # policy's end-of-turn marker and the conversation stops being
+                # valid chat, which is why every round after the first came
+                # back unparseable.
+                obs_prefix, obs_suffix = _observation_wrapper(state)
+                obs_text = obs_prefix + step.observation + obs_suffix
                 obs_token_ids = state.tokenizer(
-                    step.observation, add_special_tokens=False
+                    obs_text, add_special_tokens=False
                 )["input_ids"]
-                response += step.observation
+                response += obs_text
                 response_token_ids += obs_token_ids
                 loss_mask += [0] * len(obs_token_ids)
                 # Environment feedback tokens are non-trainable; pad the
