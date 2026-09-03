@@ -101,7 +101,7 @@ conda activate ldm-rl
 export PYTHONPATH=$LDM/rl/megatron-lm:$LDM/rl:$LDM
 srun bash $LDM/rl/slime_launch/run_train_real_9b.sh
 ```
-每个 run 建议 ≥3–5 seed(`--seed-offset`)。开 wandb: `export WANDB_KEY=<key>`。
+每个 run 建议 ≥3–5 seed:**换环境 seed 要用 `python -m ldm_rl.episodes --seed-offset N` 重新生成 episodes**(`--seed-offset` 是 `episodes.py` 的参数,**不是** slime/训练启动器的;slime 的 `--seed`/`--rollout-seed` 只管框架侧随机性,改了不换环境轨迹)。开 wandb: `export WANDB_KEY=<key>`。
 
 ## 6. 训练计划（分阶段,带验证闸;实验组见 TRAINING_PLAN.md）
 1. **P0**:1.5B 跑通 GRPO,验 **backward(ARM/TE 是否 SIGSEGV)+ docking + reward** 全链路。**这是最先做的闸——TE 装对没对,这一步见分晓。**

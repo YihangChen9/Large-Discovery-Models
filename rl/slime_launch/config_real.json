@@ -12,7 +12,7 @@
     "iterations": 20,
     "reservoir_size": 2,
     "evaluations_per_round": 1,
-    "reward": "acquisition"
+    "reward": "hypervolume"
   },
   "training": {
     "num_rollout": 50,
@@ -31,7 +31,7 @@
     "vina_pdb_id": "8UN5",
     "vina_chain_id": "A",
     "method": "m1_stratified_direct_llm_sir",
-    "kernel": "sk",
+    "kernel": "fp",
     "acq": "ehvi",
     "acq_weights": "0.5,0.5",
     "gp_device": "cpu",
