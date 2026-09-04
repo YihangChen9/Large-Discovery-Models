@@ -43,7 +43,16 @@ jq_get() { python3 -c "import json;print(json.load(open('$CONFIG'))['training'][
 NUM_ROLLOUT=$(jq_get num_rollout)
 ROLLOUT_BATCH=$(jq_get rollout_batch_size)
 N_SAMPLES=${N_SAMPLES:-$(jq_get n_samples_per_prompt)}   # env-overridable (e.g. N_SAMPLES=4)
-GLOBAL_BATCH=$(jq_get global_batch_size)
+# Derive global_batch from n_samples so optimizer-steps-per-rollout stays FIXED as
+# n_samples varies. A hard-coded global_batch silently changes the training budget
+# when the group-size knob moves (PR #2 §3: n=4 got 2x the updates of n=2), which
+# confounds any n_samples ablation. updates = rollout_batch * n_samples / global_batch.
+UPDATES_PER_ROLLOUT=${UPDATES_PER_ROLLOUT:-1}
+if [ $(( (ROLLOUT_BATCH * N_SAMPLES) % UPDATES_PER_ROLLOUT )) -ne 0 ]; then
+  echo "ERROR: rollout_batch($ROLLOUT_BATCH) * n_samples($N_SAMPLES) not divisible by UPDATES_PER_ROLLOUT($UPDATES_PER_ROLLOUT)"; exit 1
+fi
+GLOBAL_BATCH=$(( ROLLOUT_BATCH * N_SAMPLES / UPDATES_PER_ROLLOUT ))
+echo "resolved: rollout_batch=$ROLLOUT_BATCH n_samples=$N_SAMPLES updates_per_rollout=$UPDATES_PER_ROLLOUT -> global_batch=$GLOBAL_BATCH"
 RESP_LEN=$(jq_get rollout_max_response_len)
 MAX_TOKENS=$(jq_get max_tokens_per_gpu)
 TEMPERATURE=$(jq_get rollout_temperature)

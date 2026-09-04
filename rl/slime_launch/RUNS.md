@@ -4,12 +4,15 @@ Real-mode GRPO on the small-molecule LDM loop. **Train on KRAS G12D** (ready
 evaluator: `best_g12d_model.joblib` + 8UN5), **evaluate on G12C and G12D**.
 **One episode file per run** — each run gets its **own** `gp_history_file` +
 `output_dir` (sharing a GP across runs couples their rewards; see PR #2 / nb 06).
-**Primary reward is `acquisition` with `n_samples_per_prompt=4`** — measured best
-in PR #2 (using the `std<1e-6` gradient gate, acquisition+n=4 had 0 degenerate
-steps vs ΔHV's ~21%; the ΔHV win was an artifact of a metric blind spot). R3
-keeps ΔHV as an ablation, now with a **fixed** `reward_ref_point` (the moving
-nadir is disabled — it rewarded evaluating bad molecules). Two axes, sharing R2
-as the pivot:
+**Defaults (not "proven optimal"):** reward `acquisition`, `n_samples_per_prompt=4`.
+Acquisition is the default because ΔHV's moving nadir is broken (it rewarded
+evaluating bad molecules; disabled — R3 keeps ΔHV only as an ablation with a
+**fixed** `reward_ref_point`). n=4 is a reasonable group size, **but PR #2's later
+audit found no cell contrast in the reward×n matrix is established** — the earlier
+"acquisition+n=4 vs ΔHV" and "n=4 vs n=2" gaps were confounded by unequal
+truncation depth and by `global_batch` coupling (fixed here: `run_train_real_9b.sh`
+now derives `global_batch` from `n_samples`). Treat these as sane starting points,
+not results. Two axes, sharing R2 as the pivot:
 
 | Run | Model (`MODEL_HF`) | Reward | Episodes file |
 |-----|--------------------|--------|---------------|
@@ -23,9 +26,12 @@ as the pivot:
 - Seeds: change the **environment** seed by regenerating with
   `python -m ldm_rl.episodes --seed-offset N` (it is an `episodes.py` flag, not a
   slime one); ≥3–5 seeds per run for error bars.
-- Zero-variance is killed by **group size**, not the reward form: `n=4` took
-  acquisition to 0 degenerate steps. Watch the `std<1e-6` gate (the value the
-  advantage actually divides by), not exact-equality `count_0.0`.
+- Watch the `std<1e-6` gate (the value the advantage actually divides by), not
+  exact-equality `count_0.0`. Also note (PR #2): `raw_reward` is a shrinking ruler
+  (EHVI vs a growing GP) and does not measure policy quality — do not read a
+  falling `raw_reward` as the policy getting worse; and no 9B run has yet produced
+  a healthy gradient (nan originates in a full-attention layer's backward), so a
+  completed rollout is not yet a completed *training* run.
 
 ## 0. One-time prep
 ```bash
