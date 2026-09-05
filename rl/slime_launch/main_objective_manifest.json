@@ -1,0 +1,135 @@
+{
+ "generated_utc": "2026-09-05",
+ "scope": "SID 3edc5462-19e3-492e-9aeb-534e7b0e31c5 / Large Discovery Model",
+ "main_objective": {
+  "question": "Does RL on top of SFT beat SFT-only?",
+  "primary_metric": "Pareto hypervolume at search budget 80",
+  "eval_sets": [
+   "G12D in-distribution",
+   "G12C transfer"
+  ],
+  "status": "NOT-DONE",
+  "blocking_gap": "no 9B run has completed an optimizer step with a finite gradient (238/238 grad_norm nan or inf)"
+ },
+ "nine_b_runs_with_checkpoints": {
+  "R1-base-v2_20260902T081145Z": {
+   "n_ckpt": 3,
+   "last_iter": "iter_0000029",
+   "hidden": 4096,
+   "finite_grad_steps": 0
+  },
+  "R2-clip001_20260902T073253Z": {
+   "n_ckpt": 2,
+   "last_iter": "iter_0000019",
+   "hidden": 4096,
+   "finite_grad_steps": 0
+  },
+  "R2-lr1e8_20260902T072304Z": {
+   "n_ckpt": 2,
+   "last_iter": "iter_0000019",
+   "hidden": 4096,
+   "finite_grad_steps": 0
+  },
+  "R2-nonanguard_20260902T061759Z": {
+   "n_ckpt": 4,
+   "last_iter": "iter_0000039",
+   "hidden": 4096,
+   "finite_grad_steps": 0
+  },
+  "R3a_20260903T113130Z": {
+   "n_ckpt": 3,
+   "last_iter": "iter_0000029",
+   "hidden": 4096,
+   "finite_grad_steps": 0
+  },
+  "R3f_20260903T114742Z": {
+   "n_ckpt": 2,
+   "last_iter": "iter_0000019",
+   "hidden": 4096,
+   "finite_grad_steps": 0
+  },
+  "R3j_20260903T121641Z": {
+   "n_ckpt": 1,
+   "last_iter": "iter_0000009",
+   "hidden": 4096,
+   "finite_grad_steps": 0
+  }
+ },
+ "scale_census": {
+  "hidden=1536": {
+   "runs": 248,
+   "with_ckpt": 100
+  },
+  "unknown": {
+   "runs": 18,
+   "with_ckpt": 0
+  },
+  "hidden=4096": {
+   "runs": 87,
+   "with_ckpt": 7
+  }
+ },
+ "primary_metric_artifacts": {
+  "budget80_eval_outputs": [],
+  "count": 0
+ },
+ "lr0_diagnostic": {
+  "scale": "1.5B",
+  "metric": "Spearman(vina, proposal index)",
+  "NOT_the_main_metric": true,
+  "difference": {
+   "diff": -0.066,
+   "ci": [
+    -0.1475,
+    0.0155
+   ],
+   "p": 0.0961,
+   "verdict": "not detected"
+  },
+  "equivalence": {
+   "margin": 0.1,
+   "lower_p": 0.1762,
+   "upper_p": 0.0011,
+   "verdict": "not established",
+   "upper_rejects": "trained arm exceeding control by >=0.10"
+  },
+  "power": {
+   "pooled_sd": 0.0544,
+   "resolvable_delta": 0.108,
+   "verdict": "underpowered"
+  },
+  "inference_class": "descriptive contrast between two conditionally-selected groups",
+  "gpu_hours_used": 21.93,
+  "gpu_hours_authorised": 27.5,
+  "authorisation_note": "spent; remainder NOT transferable to the main objective"
+ },
+ "cpu_prereqs": {
+  "script": "code/cpu_eval_prereqs.sh",
+  "sha256_16": "a45c373da657e1cd",
+  "status": "verified",
+  "packages": 11,
+  "qsar_models": {
+   "G12C": "AverageRegressor",
+   "G12D": "Pipeline",
+   "predict_from_smiles": true
+  },
+  "hypervolume_backend": "botorch.utils.multi_objective.hypervolume.Hypervolume",
+  "open_gap": "8UN5 receptor file not found within depth 4"
+ },
+ "identity": {
+  "handoff_branch": "handoff-pr",
+  "handoff_head": "995059980eb3822ea948adab592612f152064183",
+  "files": {
+   "plan/harvest_lr0_arm.py": "81ed32ef847c196d",
+   "plan/PRESPEC_lr0_control.md": "74c798cec7dafe0a",
+   "plan/MAIN_OBJECTIVE_AUDIT.md": "c9780d363eec16e1",
+   "plan/MINIMAL_RL_GAIN_TEST.md": "48e2289e62b9a90a",
+   "plan/audit_main_objective.py": "bb9934eea5f4877e"
+  }
+ },
+ "live_compute": {
+  "ldmrl_steps_running": 0,
+  "orchestrators_running": 0,
+  "note": "shared allocations belong to other work and were not touched"
+ }
+}
