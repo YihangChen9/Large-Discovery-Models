@@ -1,16 +1,24 @@
 #!/bin/bash
-# DENSE control run: Qwen2.5-7B-Instruct (standard transformer), same RL pipeline.
+# Qwen2.5-7B-Instruct (dense) — the model we take END-TO-END first.
 #
-# Purpose: isolate the 9B NaN-gradient blocker. The Qwen3.5-9B hybrid (Gated
-# DeltaNet + full-attention + MTP) has never logged a finite optimizer step (nan
-# originating in a full-attention backward), while dense 1.5B trains cleanly. This
-# runs a dense 7B — same loop, same reward, same data — to answer one question:
-#   does GRPO backward produce FINITE grad_norm on a dense 7-9B-scale model?
-# - finite here  -> the blocker is the hybrid architecture's backward, not the
-#                   pipeline / reward / data.
-# - still nan    -> the problem is general (config / optimizer / env), not hybrid.
+# History: this launcher was first the dense CONTROL for the 9B nan blocker. The
+# control ran (finite grad_norm on a dense 7B where 9B produced none), so its
+# question is answered and we now use the same launcher to get the FIRST complete
+# result on this pipeline: a run that actually trains, checkpoints, and feeds the
+# offline G12C/G12D hypervolume eval — a working baseline while 9B's nan is chased.
 #
-# This is a control, NOT the paper model. Watch train/grad_norm only.
+# ── the one thing that makes "complete" mean something ────────────────────────
+# In the control every arm moved weights by exactly one bf16 ULP (1.526e-05 =
+# 2^-16): at lr=1e-6 with bf16 optimizer momenta the Adam update (~lr in size)
+# lands on the bf16 grid, so the optimizer APPLIES a step but the model does not
+# LEARN. A "complete" run under that config would just reproduce the SFT/base
+# hypervolume. So this launcher defaults to:
+#   - fp32 optimizer momenta (MOMENTA_DTYPE=fp32) so the update is representable;
+#   - an overridable LR (default bumped off 1e-6).
+# BEFORE the full run: do a short pre-check (a few steps) and confirm the per-
+# tensor weight delta is >> 1 ULP. If it still quantises, raise LR further.
+# fp32 momenta costs optimizer memory (~10->16 bytes/param); if it OOMs on the
+# 96GB card, set MOMENTA_DTYPE=bf16 and lean on LR instead, or raise TP.
 #
 # ── set for your cluster ──────────────────────────────────────────────────────
 export REPO_ROOT=${REPO_ROOT:?set REPO_ROOT, e.g. /path/to/LDM}
@@ -45,7 +53,11 @@ GLOBAL_BATCH=$(( ROLLOUT_BATCH * N_SAMPLES / UPDATES_PER_ROLLOUT ))
 RESP_LEN=$(jq_get rollout_max_response_len)
 MAX_TOKENS=$(jq_get max_tokens_per_gpu)
 TEMPERATURE=$(jq_get rollout_temperature)
-LR=$(jq_get lr)
+# config lr is 1e-6 -> 1-ULP updates (see header). Overridable; default bumped.
+LR=${LR:-1e-5}
+# fp32 momenta so the Adam update is not quantised to the bf16 grid. Override to
+# bf16 only if the fp32 optimizer state OOMs the card.
+MOMENTA_DTYPE=${MOMENTA_DTYPE:-fp32}
 SAVE_INTERVAL=$(jq_get save_interval)
 
 cd "$SLIME_ROOT"
@@ -60,13 +72,13 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len "$RESP_LEN" --rollout-temperature "$TEMPERATURE"
    --global-batch-size "$GLOBAL_BATCH" --balance-data
 )
-# Single node, 4 GPUs: TP=2 actor + 2 sglang. Same optimizer config as the real
-# 9B runs (precision-aware, bf16 momenta, master fp32) so the ONLY thing that
-# differs from the 9B is the architecture (dense vs hybrid).
+# Single node, 4 GPUs: TP=2 actor + 2 sglang. Master params fp32; momenta dtype
+# is MOMENTA_DTYPE (default fp32) so the update is not rounded to the bf16 grid.
+# Set MOMENTA_DTYPE=bf16 to fall back to the memory-lean control config.
 PERF_ARGS=(
    --tensor-model-parallel-size 2 --pipeline-model-parallel-size 1 --context-parallel-size 1
    --use-distributed-optimizer
-   --use-precision-aware-optimizer --exp-avg-dtype bf16 --exp-avg-sq-dtype bf16 --main-params-dtype fp32
+   --use-precision-aware-optimizer --exp-avg-dtype "$MOMENTA_DTYPE" --exp-avg-sq-dtype "$MOMENTA_DTYPE" --main-params-dtype fp32
    --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
    --use-dynamic-batch-size --max-tokens-per-gpu "$MAX_TOKENS"
 )
@@ -78,7 +90,8 @@ CUSTOM_ARGS=(--custom-generate-function-path ldm_rl.bridge.generate --custom-rm-
 WANDB_ARGS=()
 [[ -n "${WANDB_KEY:-}" ]] && WANDB_ARGS=(--use-wandb --wandb-project "$WANDB_PROJECT" --wandb-key "$WANDB_KEY" --wandb-run-name "$WANDB_RUN")
 
-echo "resolved: n_samples=$N_SAMPLES global_batch=$GLOBAL_BATCH (dense Qwen2.5-7B control, TP=2, precision-aware bf16 momenta)"
+echo "resolved: n_samples=$N_SAMPLES global_batch=$GLOBAL_BATCH lr=$LR momenta=$MOMENTA_DTYPE (dense Qwen2.5-7B end-to-end, TP=2)"
+echo "PRE-CHECK before the full run: run a few steps, confirm per-tensor weight delta >> 1 bf16 ULP (1.526e-05); if not, raise LR."
 
 ray stop --force 2>/dev/null || true
 sleep 3
