@@ -75,6 +75,15 @@ MODEL_HF=$SFT  MODEL_REF=$SFT_REF  EPISODES=$R/../rl_episodes_sm_R4.jsonl  SAVE=
   gains) also available but gameable across objectives.
 
 ## 3. Notes / risks
+- **`UPDATES_PER_ROLLOUT` defaults to 2, and this matters.** With 1 the whole
+  rollout is one optimizer step per rollout, which is always on-policy
+  (ratio==1): `ppo_kl` and `pg_clipfrac` come out identically zero and the run
+  is **KL-only** — the clipped GRPO objective, the off-policy correction, the
+  zero-variance handling and the `std<1e-6` metric never reach the loss (PR #2,
+  2026-09-09: a `global_batch = rollout_batch*n_samples` run logged
+  `pg_clipfrac 0/50`, `ppo_kl 0/50`). `>=2` adds a second, off-policy inner
+  update per rollout, which is what actually exercises GRPO. If you want a pure
+  on-policy PG+KL baseline instead, set it to 1 **on purpose**.
 - **Env**: use a matched torch + TE stack (see HANDOFF §2); a mismatched stack
   SIGSEGVs on GRPO backward.
 - **First 9B run**: smoke with a **tiny real** episode set (count=1, iterations=2)

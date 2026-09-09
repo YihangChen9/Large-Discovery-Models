@@ -47,7 +47,15 @@ N_SAMPLES=${N_SAMPLES:-$(jq_get n_samples_per_prompt)}   # env-overridable (e.g.
 # n_samples varies. A hard-coded global_batch silently changes the training budget
 # when the group-size knob moves (PR #2 §3: n=4 got 2x the updates of n=2), which
 # confounds any n_samples ablation. updates = rollout_batch * n_samples / global_batch.
-UPDATES_PER_ROLLOUT=${UPDATES_PER_ROLLOUT:-1}
+#
+# Default is 2, NOT 1. With UPDATES_PER_ROLLOUT=1 the whole rollout is consumed in a
+# single optimizer step, which is always on-policy (ratio==1), so ppo_kl and
+# pg_clipfrac are identically zero and the run is KL-only: the clipped GRPO
+# objective, off-policy correction, the zero-variance handling and the std<1e-6
+# metric never reach the loss (PR #2, 2026-09-09: gbs=rollout_batch*n_samples ran
+# 50 steps with pg_clipfrac 0/50, ppo_kl 0/50). >=2 gives a second, off-policy
+# inner update per rollout, which is what actually exercises GRPO.
+UPDATES_PER_ROLLOUT=${UPDATES_PER_ROLLOUT:-2}
 if [ $(( (ROLLOUT_BATCH * N_SAMPLES) % UPDATES_PER_ROLLOUT )) -ne 0 ]; then
   echo "ERROR: rollout_batch($ROLLOUT_BATCH) * n_samples($N_SAMPLES) not divisible by UPDATES_PER_ROLLOUT($UPDATES_PER_ROLLOUT)"; exit 1
 fi

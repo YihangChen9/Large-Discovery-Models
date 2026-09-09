@@ -48,7 +48,14 @@ jq_get() { python3 -c "import json;print(json.load(open('$CONFIG'))['training'][
 NUM_ROLLOUT=$(jq_get num_rollout)
 ROLLOUT_BATCH=$(jq_get rollout_batch_size)
 N_SAMPLES=${N_SAMPLES:-$(jq_get n_samples_per_prompt)}
-UPDATES_PER_ROLLOUT=${UPDATES_PER_ROLLOUT:-1}
+# Default 2, not 1: UPDATES_PER_ROLLOUT=1 consumes the whole rollout in one
+# on-policy step (ratio==1) -> ppo_kl and pg_clipfrac identically zero -> KL-only,
+# the clipped GRPO objective never reaches the loss (PR #2, 2026-09-09). >=2 gives
+# a second, off-policy inner update, which is what exercises GRPO.
+UPDATES_PER_ROLLOUT=${UPDATES_PER_ROLLOUT:-2}
+if [ $(( (ROLLOUT_BATCH * N_SAMPLES) % UPDATES_PER_ROLLOUT )) -ne 0 ]; then
+  echo "ERROR: rollout_batch($ROLLOUT_BATCH)*n_samples($N_SAMPLES) not divisible by UPDATES_PER_ROLLOUT($UPDATES_PER_ROLLOUT)"; exit 1
+fi
 GLOBAL_BATCH=$(( ROLLOUT_BATCH * N_SAMPLES / UPDATES_PER_ROLLOUT ))
 RESP_LEN=$(jq_get rollout_max_response_len)
 MAX_TOKENS=$(jq_get max_tokens_per_gpu)
