@@ -28,13 +28,28 @@ def extract_json_object_text(text: str) -> str:
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.I | re.S)
     if fenced:
         return fenced.group(1)
-    if stripped.startswith("{"):
-        return stripped
+    # Take the FIRST complete object, not everything up to the last brace.
+    #
+    # A policy's turn very often carries a tail after its JSON: the chat
+    # template's own end-of-turn marker, a second copy of the same object, or
+    # a trailing sentence. Slicing to the last `}` spans that tail, json.loads
+    # then fails with "Extra data: line 1 column N", and a reply that did
+    # contain the requested shape is thrown away -- measured on a 1.5B run
+    # where the model answered correctly and the round was rejected anyway.
+    #
+    # This applies just as much when the object is preceded by prose ("Here is
+    # the JSON: {...}"), which is why the offset and the bare cases share one
+    # path rather than only the latter being fixed.
     start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start < 0 or end <= start:
+    if start < 0:
         raise ValueError("no JSON object found")
-    return stripped[start : end + 1]
+    try:
+        _, end = json.JSONDecoder().raw_decode(stripped[start:])
+    except ValueError:
+        # Hand back what we have and let the caller's json.loads report the
+        # real parse error, rather than inventing one here.
+        return stripped[start:]
+    return stripped[start : start + end]
 
 
 def load_json_object(text: str) -> dict[str, Any]:
